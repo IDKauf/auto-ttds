@@ -1,0 +1,19 @@
+{
+  "name": "auto-ttds",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Ring animal detection to Rachio hose-timer sprinklers, with a review page",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "start": "node src/main.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.126.0",
+    "ring-client-api": "^14.3.0"
+  }
+}

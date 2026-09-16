@@ -1,0 +1,41 @@
+# Add-on manifest (spec section 3). No image: key, so the Supervisor builds locally from the Dockerfile.
+name: auto-ttds
+version: 0.1.0
+slug: auto_ttds
+description: Ring animal detection to Rachio hose-timer sprinklers, with a review page
+arch:
+  - amd64
+startup: application
+init: false
+homeassistant_api: true
+ingress: true
+ingress_port: 8099
+panel_icon: mdi:cat
+panel_title: auto-ttds
+map:
+  - homeassistant_config:rw
+  - share:rw
+options:
+  anthropic_api_key: ""
+  classifier_model: claude-haiku-4-5
+  poll_interval_s: 10
+  ring_token_file: /homeassistant/.auto-ttds/ring-token.json
+  ring_system_id_file: /homeassistant/.auto-ttds/system-id
+  rachio_env_file: /homeassistant/.auto-ttds/rachio.env
+  data_dir: /share/auto-ttds
+  log_level: info
+  stale_after_s: 300
+  migrate_events_jsonl: /homeassistant/.auto-ttds/events.jsonl
+  migrate_clips_dir: /homeassistant/.auto-ttds/data
+schema:
+  anthropic_api_key: password
+  classifier_model: str
+  poll_interval_s: int(5,120)
+  ring_token_file: str
+  ring_system_id_file: str
+  rachio_env_file: str
+  data_dir: str
+  log_level: list(debug|info|warning)
+  stale_after_s: int(30,3600)
+  migrate_events_jsonl: str
+  migrate_clips_dir: str

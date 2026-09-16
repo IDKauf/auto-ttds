@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>auto-ttds</title>
+<style>
+/* spec 8: one file, inline CSS and JS, no CDN, light and dark, usable at 400 px */
+:root {
+  color-scheme: light dark;
+  --bg: #f6f7f9; --card: #ffffff; --ink: #14161a; --muted: #5d6470; --line: #d9dde3;
+  --accent: #2f6df6; --fire: #1f9d55; --skip: #98a1ae; --warn: #b8541a;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #14161a; --card: #1d2026; --ink: #e8eaee; --muted: #9aa3b0; --line: #2c313a;
+          --accent: #6d9bff; --fire: #45c07d; --skip: #6c7482; --warn: #e08a4a; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { padding: 12px 16px; display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+h1 { font-size: 18px; margin: 0; }
+.sub { color: var(--muted); font-size: 12px; }
+main { padding: 0 16px 40px; max-width: 1200px; margin: 0 auto; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; margin-bottom: 14px; }
+.tile { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+.tile .k { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+.tile .v { font-size: 20px; font-weight: 600; margin-top: 2px; }
+.tile .n { font-size: 11px; color: var(--muted); }
+.panel { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-bottom: 14px; }
+.filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+select, input[type=text], input[type=number], button { font: inherit; color: var(--ink); background: var(--bg);
+  border: 1px solid var(--line); border-radius: 7px; padding: 5px 8px; }
+button { cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+label.check { display: inline-flex; gap: 5px; align-items: center; font-size: 13px; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); white-space: nowrap; }
+td.mono, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.pill { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; border: 1px solid var(--line); }
+.pill.fire { background: var(--fire); border-color: var(--fire); color: #fff; }
+.pill.skip { background: transparent; color: var(--muted); }
+.pill.defer { background: var(--warn); border-color: var(--warn); color: #fff; }
+.thumbs { display: flex; gap: 4px; }
+.thumbs img { width: 52px; height: 30px; object-fit: cover; border-radius: 4px; border: 1px solid var(--line); cursor: pointer; }
+.labelbox { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.labelbox input[type=text] { width: 96px; }
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+.chart h3 { font-size: 13px; margin: 0 0 6px; color: var(--muted); font-weight: 600; }
+svg { width: 100%; height: 130px; display: block; }
+.axis { fill: var(--muted); font-size: 9px; }
+.bar { fill: var(--accent); }
+dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--card); color: var(--ink); max-width: 96vw; }
+dialog img, dialog video { max-width: 90vw; max-height: 78vh; display: block; }
+.rowwrap { overflow-x: auto; }
+.note { color: var(--muted); font-size: 12px; }
+.saved { color: var(--fire); font-size: 11px; }
+@media (max-width: 640px) {
+  main { padding: 0 10px 40px; }
+  th.hide, td.hide { display: none; }
+  table, tbody, tr, td { display: block; width: 100%; }
+  thead { display: none; }
+  tr { border-bottom: 1px solid var(--line); padding: 8px 0; }
+  td { border: 0; padding: 3px 0; }
+  td::before { content: attr(data-h) ": "; color: var(--muted); font-size: 11px; }
+  td.nolabel::before { content: ""; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>auto-ttds</h1>
+  <span class="sub" id="status">loading</span>
+</header>
+<main>
+  <div class="tiles" id="tiles"></div>
+
+  <div class="panel charts">
+    <div class="chart"><h3>Runs per day, 30 days</h3><svg id="c-runs" viewBox="0 0 320 130" preserveAspectRatio="none"></svg></div>
+    <div class="chart"><h3>Events by hour of day</h3><svg id="c-hours" viewBox="0 0 320 130" preserveAspectRatio="none"></svg></div>
+    <div class="chart"><h3>Detection to valve confirmed, seconds</h3><svg id="c-latency" viewBox="0 0 320 130" preserveAspectRatio="none"></svg></div>
+  </div>
+
+  <div class="panel">
+    <div class="filters">
+      <select id="f-camera"><option value="">All cameras</option></select>
+      <select id="f-label"><option value="">All labels</option><option>animal</option><option>human</option><option>other_motion</option><option>none</option></select>
+      <select id="f-action"><option value="">All actions</option><option>fire</option><option>skip</option><option>defer</option></select>
+      <select id="f-test"><option value="hide">Hide test events</option><option value="">Show test events</option><option value="only">Test events only</option></select>
+      <label class="check"><input type="checkbox" id="f-unlabeled"> Unlabeled only</label>
+      <input type="number" id="f-limit" value="200" min="1" max="1000" style="width:78px">
+      <button id="reload">Reload</button>
+      <a id="csv" href="api/export/labels.csv">Export labels CSV</a>
+      <button id="deltests">Delete test events</button>
+    </div>
+  </div>
+
+  <div class="panel rowwrap">
+    <table>
+      <thead><tr>
+        <th>Time</th><th>Camera</th><th>Ring</th><th>Species</th><th>Action</th>
+        <th class="hide">Run</th><th class="hide">Clip delay</th><th>Frames</th><th>Label</th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <p class="note" id="empty" hidden>No events match these filters.</p>
+  </div>
+</main>
+
+<dialog id="viewer"><div id="viewer-body"></div><p><button id="viewer-close">Close</button></p></dialog>
+
+<script>
+// Relative URLs only, so the HA ingress prefix in X-Ingress-Path never has to be baked in.
+const BASE = location.pathname.endsWith('/') ? location.pathname : location.pathname + '/';
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const num = (n, d = 0) => (n === null || n === undefined ? '-' : Number(n).toFixed(d));
+const pct = (n) => (n === null || n === undefined ? '-' : (n * 100).toFixed(0) + '%');
+
+function localTime(iso) {
+  if (!iso) return '-';
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+async function api(path, options) {
+  const res = await fetch(BASE + path, options);
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  return res.json();
+}
+
+// ---- tiles (spec 8.1) -----------------------------------------------------
+function renderTiles(m) {
+  const r = m.label_rates || { day: {}, night: {} };
+  const pushText = m.push_count ? m.push_count + ' seen' : 'none yet';
+  const tiles = [
+    ['Events today', m.events_today, m.events_7d + ' in 7 days'],
+    ['Runs today', m.runs_today, m.runs_7d + ' in 7 days'],
+    ['Spend this month', '$' + num(m.spend_month_usd, 4), (m.calls_month || 0) + ' classifier calls'],
+    ['Push status', pushText, m.push_last_at ? 'last ' + localTime(m.push_last_at) : 'poll is the live path'],
+    ['Clip delay median', m.clip_delay_median_s === null ? '-' : num(m.clip_delay_median_s, 0) + ' s', 'Ring event to clip on disk'],
+    ['False spray, day', pct(r.day.falseSprayRate), (r.day.fired || 0) + ' fired and labeled'],
+    ['False spray, night', pct(r.night.falseSprayRate), (r.night.fired || 0) + ' fired and labeled'],
+    ['Miss rate, day / night', pct(r.day.missRate) + ' / ' + pct(r.night.missRate), 'labeled wrong among skips'],
+    ['Events stored', m.events_total, 'all time'],
+    ['Health', m.health ? m.health.state : 'unknown', m.health ? ('poll ok: ' + m.health.last_poll_ok) : ''],
+  ];
+  $('tiles').innerHTML = tiles.map(([k, v, n]) =>
+    '<div class="tile"><div class="k">' + esc(k) + '</div><div class="v">' + esc(v) + '</div><div class="n">' + esc(n) + '</div></div>').join('');
+}
+
+// ---- charts (spec 8.4), plain SVG ----------------------------------------
+function barChart(svgId, labels, values, everyNth) {
+  const svg = $(svgId);
+  const W = 320, H = 130, pad = 18, top = 8;
+  const max = Math.max(1, ...values);
+  const n = Math.max(1, values.length);
+  const bw = (W - pad - 4) / n;
+  let out = '';
+  values.forEach((v, i) => {
+    const h = (H - top - pad) * (v / max);
+    out += '<rect class="bar" x="' + (pad + i * bw + 1).toFixed(1) + '" y="' + (H - pad - h).toFixed(1) +
+           '" width="' + Math.max(1, bw - 2).toFixed(1) + '" height="' + h.toFixed(1) + '"><title>' + esc(labels[i]) + ': ' + v + '</title></rect>';
+  });
+  out += '<line x1="' + pad + '" y1="' + (H - pad) + '" x2="' + W + '" y2="' + (H - pad) + '" stroke="currentColor" opacity=".25"/>';
+  out += '<text class="axis" x="2" y="' + (top + 8) + '">' + max + '</text>';
+  labels.forEach((l, i) => {
+    if (i % everyNth) return;
+    out += '<text class="axis" x="' + (pad + i * bw).toFixed(1) + '" y="' + (H - 6) + '">' + esc(l) + '</text>';
+  });
+  svg.innerHTML = out;
+}
+
+function renderCharts(m) {
+  const days = [];
+  for (let i = 29; i >= 0; i--) days.push(new Date(Date.now() - i * 86400000).toISOString().slice(0, 10));
+  const byDay = Object.fromEntries((m.runs_per_day || []).map((r) => [r.day, r.n]));
+  barChart('c-runs', days.map((d) => d.slice(5)), days.map((d) => byDay[d] || 0), 7);
+
+  const hours = Array.from({ length: 24 }, (_, h) => h);
+  const byHour = Object.fromEntries((m.events_by_hour || []).map((r) => [r.hour, r.n]));
+  barChart('c-hours', hours.map((h) => String(h)), hours.map((h) => byHour[h] || 0), 3);
+
+  const lat = m.latencies_s || [];
+  const edges = [0, 5, 10, 20, 30, 45, 60, 90, 120, 300];
+  const counts = edges.map(() => 0);
+  lat.forEach((v) => {
+    let i = edges.length - 1;
+    while (i > 0 && v < edges[i]) i--;
+    counts[i]++;
+  });
+  barChart('c-latency', edges.map((e, i) => (i === edges.length - 1 ? e + '+' : e + '-' + edges[i + 1])), counts, 2);
+}
+
+// ---- table (spec 8.2, 8.3) -----------------------------------------------
+function actionPill(row) {
+  if (!row.action) return '<span class="pill skip">pending</span>';
+  const cls = row.action === 'fire' ? 'fire' : (row.action === 'defer' ? 'defer' : 'skip');
+  const dry = row.run_dry ? ' dry' : '';
+  return '<span class="pill ' + cls + '">' + esc(row.action) + dry + '</span> <span class="note">' + esc(row.reason || '') + '</span>';
+}
+
+function runCell(row) {
+  if (!row.run_count) return '-';
+  if (row.run_dry) return 'dry run';
+  if (!row.run_confirmed) return 'no';
+  const secs = row.run_called_at && row.run_confirmed_at
+    ? ((Date.parse(row.run_confirmed_at) - Date.parse(row.run_called_at)) / 1000).toFixed(1) + ' s' : '';
+  return 'yes ' + secs;
+}
+
+function clipDelay(row) {
+  if (!row.clip_ready_at || !row.ring_created_at) return '-';
+  return ((Date.parse(row.clip_ready_at) - Date.parse(row.ring_created_at)) / 1000).toFixed(0) + ' s';
+}
+
+function frameCells(row) {
+  let frames = [];
+  try { frames = JSON.parse(row.frames_json || '[]'); } catch (e) { frames = []; }
+  let html = '<div class="thumbs">';
+  frames.forEach((f) => {
+    const u = BASE + 'media/frames/' + encodeURIComponent(f);
+    html += '<img loading="lazy" src="' + u + '" alt="frame" data-full="' + u + '">';
+  });
+  if (row.clip_path) {
+    const parts = String(row.clip_path).split('/');
+    const u = BASE + 'media/clips/' + encodeURIComponent(parts[parts.length - 2]) + '/' + encodeURIComponent(parts[parts.length - 1]);
+    html += '<button data-clip="' + u + '">clip</button>';
+  }
+  return html + '</div>';
+}
+
+function labelCell(row) {
+  const id = esc(row.event_id);
+  const correct = row.correct;
+  return '<div class="labelbox" data-event="' + id + '">' +
+    '<button data-mark="1" class="' + (correct === 1 ? 'primary' : '') + '">Correct</button>' +
+    '<button data-mark="0" class="' + (correct === 0 ? 'primary' : '') + '">Wrong</button>' +
+    '<input type="text" data-actual placeholder="actually was" value="' + esc(row.actual || '') + '">' +
+    '<label class="check"><input type="checkbox" data-friendly ' + (row.label_friendly ? 'checked' : '') + '> friendly</label>' +
+    '<input type="text" data-note placeholder="note" value="' + esc(row.note || '') + '">' +
+    '<span class="saved" hidden>saved</span></div>';
+}
+
+function renderRows(events) {
+  $('empty').hidden = events.length > 0;
+  $('rows').innerHTML = events.map((row) => {
+    const species = row.species ? esc(row.species) + (row.confidence != null ? ' ' + Number(row.confidence).toFixed(2) : '') : (row.verdict_error ? 'error' : '-');
+    return '<tr>' +
+      '<td data-h="Time" class="mono">' + esc(localTime(row.ring_created_at)) + (row.test ? ' <span class="pill">test</span>' : '') + '</td>' +
+      '<td data-h="Camera">' + esc(row.camera_name || row.camera_id) + '</td>' +
+      '<td data-h="Ring">' + esc(row.ring_label || 'none') + '</td>' +
+      '<td data-h="Species">' + species + '</td>' +
+      '<td data-h="Action">' + actionPill(row) + '</td>' +
+      '<td data-h="Run" class="hide">' + esc(runCell(row)) + '</td>' +
+      '<td data-h="Clip delay" class="hide">' + esc(clipDelay(row)) + '</td>' +
+      '<td data-h="Frames" class="nolabel">' + frameCells(row) + '</td>' +
+      '<td data-h="Label" class="nolabel">' + labelCell(row) + '</td>' +
+    '</tr>';
+  }).join('');
+}
+
+// ---- label posting --------------------------------------------------------
+// Review item 13: the table is only redrawn when nothing in it is focused and nothing is unsaved.
+function rowsBusy() {
+  const rows = $('rows');
+  if (document.activeElement && rows.contains(document.activeElement)) return true;
+  return rows.querySelector('.labelbox[data-dirty="1"]') !== null;
+}
+
+async function postLabel(box, correct) {
+  const body = {
+    event_id: box.dataset.event,
+    by: 'ingress',
+    correct: correct,
+    actual: box.querySelector('[data-actual]').value.trim() || null,
+    friendly: box.querySelector('[data-friendly]').checked,
+    note: box.querySelector('[data-note]').value.trim() || null,
+  };
+  await api('api/label', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  box.removeAttribute('data-dirty');
+  const saved = box.querySelector('.saved');
+  saved.hidden = false;
+  setTimeout(() => { saved.hidden = true; }, 1500);
+}
+
+document.addEventListener('click', async (ev) => {
+  const mark = ev.target.closest('[data-mark]');
+  if (mark) {
+    const box = mark.closest('.labelbox');
+    const value = Number(mark.dataset.mark);
+    box.querySelectorAll('[data-mark]').forEach((b) => b.classList.remove('primary'));
+    mark.classList.add('primary');
+    await postLabel(box, value);
+    return;
+  }
+  const img = ev.target.closest('img[data-full]');
+  if (img) { $('viewer-body').innerHTML = '<img src="' + img.dataset.full + '" alt="frame">'; $('viewer').showModal(); return; }
+  const clip = ev.target.closest('[data-clip]');
+  if (clip) { $('viewer-body').innerHTML = '<video controls autoplay src="' + clip.dataset.clip + '"></video>'; $('viewer').showModal(); return; }
+});
+
+document.addEventListener('input', (ev) => {
+  const box = ev.target.closest('.labelbox');
+  if (box) box.setAttribute('data-dirty', '1');
+});
+
+document.addEventListener('change', async (ev) => {
+  const box = ev.target.closest('.labelbox');
+  if (!box) return;
+  const active = box.querySelector('[data-mark].primary');
+  await postLabel(box, active ? Number(active.dataset.mark) : null);
+});
+
+$('viewer-close').addEventListener('click', () => { $('viewer').close(); $('viewer-body').innerHTML = ''; });
+
+// ---- load -----------------------------------------------------------------
+function filterQuery() {
+  const p = new URLSearchParams();
+  p.set('limit', $('f-limit').value || '200');
+  if ($('f-camera').value) p.set('camera', $('f-camera').value);
+  if ($('f-label').value) p.set('label', $('f-label').value);
+  if ($('f-action').value) p.set('action', $('f-action').value);
+  if ($('f-test').value) p.set('test', $('f-test').value);
+  if ($('f-unlabeled').checked) p.set('unlabeled', '1');
+  return p.toString();
+}
+
+// force is true for an explicit click or filter change, false for the 30 s timer.
+async function load(force) {
+  try {
+    $('status').textContent = 'loading';
+    const metrics = await api('api/metrics');
+    renderTiles(metrics);
+    renderCharts(metrics);
+    const sel = $('f-camera');
+    if (sel.options.length <= 1) {
+      (metrics.cameras || []).forEach((c) => {
+        const o = document.createElement('option');
+        o.value = c.camera_id; o.textContent = c.camera_name || c.camera_id;
+        sel.appendChild(o);
+      });
+    }
+    if (!force && rowsBusy()) {
+      $('status').textContent = 'table paused while you are editing a label | tiles updated ' + new Date().toLocaleTimeString();
+      return;
+    }
+    const data = await api('api/events?' + filterQuery());
+    renderRows(data.events);
+    const k = metrics.knobs || {};
+    $('status').textContent = 'mode ' + (k.mode || '?') + (k.enabled === false ? ', disabled' : '') + (k.dry_run ? ', dry run' : '') +
+      ' | updated ' + new Date().toLocaleTimeString();
+  } catch (err) {
+    $('status').textContent = 'load failed: ' + err.message;
+  }
+}
+
+['f-camera', 'f-label', 'f-action', 'f-test', 'f-unlabeled', 'f-limit'].forEach((id) => $(id).addEventListener('change', () => load(true)));
+$('reload').addEventListener('click', () => load(true));
+$('deltests').addEventListener('click', async () => {
+  if (!confirm('Delete every event marked test, with its verdicts, decisions and runs?')) return;
+  const r = await api('api/delete-tests', { method: 'POST' });
+  alert('Deleted ' + r.deleted + ' test events.');
+  load(true);
+});
+load(true);
+setInterval(() => load(false), 30000);
+</script>
+</body>
+</html>
