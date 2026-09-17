@@ -172,24 +172,27 @@ export function createServer(deps) {
         return;
       }
 
+      // Two independent labels: actual (what the animal was) and should_have_fired (yes or no).
+      // Only the keys the caller sent are written, so either one can be set on its own.
       if (req.method === 'POST' && route === '/api/label') {
         const body = JSON.parse(await readBody(req) || '{}');
         if (!body.event_id) { sendJson(res, 400, { error: 'event_id required' }); return; }
-        db.upsertLabel({
-          event_id: String(body.event_id),
-          by: String(body.by ?? 'ingress'),
-          correct: body.correct === null || body.correct === undefined ? null : (body.correct ? 1 : 0),
-          actual: body.actual ?? null,
-          friendly: body.friendly ? 1 : 0,
-          note: body.note ?? null,
-          at: new Date().toISOString(),
-        });
+        const has = (k) => Object.prototype.hasOwnProperty.call(body, k);
+        const text = (v) => (v === null || v === undefined || String(v).trim() === '' ? null : String(v).trim());
+        const patch = { event_id: String(body.event_id), by: String(body.by ?? 'ingress'), at: new Date().toISOString() };
+        if (has('actual')) patch.actual = text(body.actual);
+        if (has('note')) patch.note = text(body.note);
+        if (has('should_have_fired')) {
+          patch.should_have_fired = body.should_have_fired === null || body.should_have_fired === undefined
+            ? null : (Number(body.should_have_fired) ? 1 : 0);
+        }
+        db.upsertLabel(patch);
         sendJson(res, 200, { ok: true, label: db.getLabel(String(body.event_id)) });
         return;
       }
 
       if (req.method === 'GET' && route === '/api/export/labels.csv') {
-        const head = ['event_id', 'at', 'camera_name', 'ring_created_at', 'ring_label', 'species', 'confidence', 'correct', 'actual', 'friendly', 'note'];
+        const head = ['event_id', 'at', 'camera_name', 'ring_created_at', 'ring_label', 'species', 'confidence', 'should_have_fired', 'actual', 'note'];
         const lines = [head.join(',')];
         for (const r of db.allLabels()) lines.push(head.map((h) => csvCell(r[h])).join(','));
         const text = `${lines.join('\n')}\n`;

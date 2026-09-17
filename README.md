@@ -14,8 +14,8 @@ Smart Hose Timer, classifies what the camera saw with Claude, and serves a revie
    seconds, and sends them to Claude for a species verdict.
 4. Starts the mapped Rachio valves, then polls until the cloud confirms the run and until it clears.
 5. Stores events, verdicts, decisions, runs, labels, pushes and daily costs in SQLite.
-6. Serves a review page so you can label every event as correct or wrong, which builds the training
-   set for the friendlies list.
+6. Serves a review page with two labels per event: what the animal actually was, and whether the
+   system should have fired. Those labels build the training set for the friendlies list.
 
 ## Install
 
@@ -76,13 +76,17 @@ a deliberate act rather than a slider.
 1. It does not fire on a backlog. An event created before the add-on started, or older than
    `stale_after_s` (default 300 seconds), is recorded with the decision reason `stale` and never runs
    a valve. This is what stops a restart from spraying for every event of the last two days.
-2. It does not run the same event twice, and it does not decide twice for an event that arrived by
-   push and was then seen again by the poll pass.
-3. It does not classify or download clips for cameras off the greenlist, and it does not classify an
+2. It does not run the same event twice. It decides again for an event only in one case: the poll
+   pass brings a Ring label that differs from the one the decision was made on, the decision was a
+   skip for `non_target` or `stale`, and nothing has run for that event. Ring's push payload has no
+   `animal` value, so this is what stops a push-first cat event from being skipped for good.
+3. A `human` push that arrives after a poll-triggered fire still stops the run. It does not overwrite
+   the stored `animal` label, so only the recorded label loses the human signal, never the behavior.
+4. It does not classify or download clips for cameras off the greenlist, and it does not classify an
    event with no Ring label.
-4. An event is only sent to the classifier when it is on a greenlisted camera AND carries a non-null
+5. An event is only sent to the classifier when it is on a greenlisted camera AND carries a non-null
    Ring label. That pair is deliberate: it is the cost control on the Claude spend.
-5. An Anthropic outage that outlasts the single retry leaves those events unclassified in v1. There
+6. An Anthropic outage that outlasts the single retry leaves those events unclassified in v1. There
    is no later sweep, and the verdict row holds the error.
 
 ## Reliability
@@ -106,12 +110,15 @@ a deliberate act rather than a slider.
 The page is served over ingress from the add-on sidebar panel.
 
 1. Tiles: events today and over 7 days, runs today and over 7 days, spend this month, push status,
-   median clip delay, and false-spray and miss rates split into day and night.
+   median clip delay, and false-spray and miss rates split into day and night. Each rate tile shows
+   its denominator, for example "2 of 9"; an event with no Yes or No answer counts in neither.
 2. Table, newest first, with filters for camera, Ring label, action, test events and unlabeled only.
    Each row shows the local time, camera, Ring label, species with confidence, action with reason,
    whether the run was confirmed, clip delay, three frame thumbnails and a clip button.
-3. Label controls on each row: Correct, Wrong, an "actually was" species box, a friendly checkbox and
-   a note. Labels export at `api/export/labels.csv`.
+3. Label controls on each row, two independent judgements plus a note:
+   a "was" box prefilled with the classifier species, and a Yes or No answer to "should have fired".
+   Either can be set on its own. Labels export at `api/export/labels.csv`.
+   "Unlabeled only" means no Yes or No answer yet.
 4. Three charts: runs per day over 30 days, events by hour of day, and detection to valve confirmed.
 5. A delete button for test events, which also deletes their clips and frames. Anyone who can reach
    ingress can use it.

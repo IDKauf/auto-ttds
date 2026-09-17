@@ -1,6 +1,10 @@
 // SQLite round trips and page queries on an in-memory database (spec 5, 11.1).
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { Db, median, localDayStartIso, localDayKey, localMonthKey, localHourOf, isNightHour } from '../src/db.js';
 
 const iso = (offsetMs = 0) => new Date(Date.now() + offsetMs).toISOString();
@@ -77,7 +81,7 @@ test('listEvents filters', () => {
   const db = seed();
   db.upsertDecision({ event_id: 'e1', at: iso(), action: 'fire', reason: 'target', mode: 'immediate', knobs_json: '{}' });
   db.upsertDecision({ event_id: 'e2', at: iso(), action: 'skip', reason: 'person', mode: 'immediate', knobs_json: '{}' });
-  db.upsertLabel({ event_id: 'e1', by: 'ingress', correct: 1, actual: null, friendly: 0, note: null, at: iso() });
+  db.upsertLabel({ event_id: 'e1', by: 'ingress', should_have_fired: 1, actual: null, note: null, at: iso() });
 
   assert.equal(db.listEvents({}).length, 2);
   assert.equal(db.listEvents({ camera: '639481050' }).length, 1);
@@ -85,7 +89,11 @@ test('listEvents filters', () => {
   assert.equal(db.listEvents({ action: 'fire' })[0].event_id, 'e1');
   assert.equal(db.listEvents({ test: 'hide' }).length, 1);
   assert.equal(db.listEvents({ test: 'only' })[0].event_id, 'e2');
-  assert.equal(db.listEvents({ unlabeled: true })[0].event_id, 'e2');
+  const unlabeled = db.listEvents({ unlabeled: true });
+  assert.equal(unlabeled.length, 1, 'unlabeled means no answer to should_have_fired');
+  assert.equal(unlabeled[0].event_id, 'e2');
+  assert.equal(db.listEvents({ camera: '639481050' })[0].should_have_fired, 1);
+  assert.equal(db.listEvents({ camera: '639481050' })[0].labeled, 1);
   assert.equal(db.listEvents({ limit: 1 }).length, 1);
   // newest first
   assert.equal(db.listEvents({})[0].event_id, 'e2');
@@ -117,24 +125,126 @@ test('clip delay, runs per day, hour histogram and latencies', () => {
   db.close();
 });
 
-test('label rates split day and night', () => {
+test('label rates come from should_have_fired, split day and night', () => {
   const db = new Db(':memory:');
-  const mk = (id, hourLocal, action, correct) => {
+  const mk = (id, hourLocal, action, shouldHaveFired) => {
     const d = new Date(); d.setHours(hourLocal, 0, 0, 0);
     db.insertEvent({ event_id: id, camera_id: 'c', ring_created_at: d.toISOString(), first_seen_at: d.toISOString(), source: 'poll', test: 0 });
     db.upsertDecision({ event_id: id, at: d.toISOString(), action, reason: 'target', mode: 'immediate', knobs_json: '{}' });
-    db.upsertLabel({ event_id: id, by: 't', correct, actual: null, friendly: 0, note: null, at: d.toISOString() });
+    db.upsertLabel({ event_id: id, by: 't', should_have_fired: shouldHaveFired, actual: null, note: null, at: d.toISOString() });
   };
-  mk('d1', 12, 'fire', 1);
-  mk('d2', 13, 'fire', 0);
+  mk('d1', 12, 'fire', 1);   // fired and wanted: neither numerator
+  mk('d2', 13, 'fire', 0);   // fired and not wanted: a false spray
+  mk('d3', 14, 'skip', 0);   // skipped and not wanted: correct
+  mk('d4', 15, 'skip', 1);   // skipped but wanted: a miss
   mk('n1', 22, 'fire', 0);
-  mk('n2', 23, 'skip', 0);
+  mk('n2', 23, 'skip', 1);
   const r = db.labelRates();
   assert.equal(r.day.fired, 2);
+  assert.equal(r.day.falseSpray, 1);
   assert.equal(r.day.falseSprayRate, 0.5);
+  assert.equal(r.day.skipped, 2);
+  assert.equal(r.day.missed, 1);
+  assert.equal(r.day.missRate, 0.5);
   assert.equal(r.night.falseSprayRate, 1);
   assert.equal(r.night.missRate, 1);
   db.close();
+});
+
+test('an event labeled only with a species counts in neither rate', () => {
+  const db = new Db(':memory:');
+  const at = new Date(); at.setHours(12, 0, 0, 0);
+  db.insertEvent({ event_id: 'u1', camera_id: 'c', ring_created_at: at.toISOString(), first_seen_at: at.toISOString(), source: 'poll', test: 0 });
+  db.upsertDecision({ event_id: 'u1', at: at.toISOString(), action: 'fire', reason: 'target', mode: 'immediate', knobs_json: '{}' });
+  db.upsertLabel({ event_id: 'u1', by: 't', actual: 'cat', note: 'no verdict on whether it should have fired', at: at.toISOString() });
+  const r = db.labelRates();
+  assert.equal(r.day.fired, 0, 'an unlabeled event is never counted as correct');
+  assert.equal(r.day.falseSprayRate, null);
+  assert.equal(r.day.missRate, null);
+  db.close();
+});
+
+test('the two labels are written independently', () => {
+  const db = seed();
+  db.upsertLabel({ event_id: 'e1', by: 'ingress', actual: 'cat', at: iso() });
+  assert.equal(db.getLabel('e1').actual, 'cat');
+  assert.equal(db.getLabel('e1').should_have_fired, null);
+
+  db.upsertLabel({ event_id: 'e1', by: 'ingress', should_have_fired: 1, at: iso() });
+  assert.equal(db.getLabel('e1').actual, 'cat', 'one label does not clear the other');
+  assert.equal(db.getLabel('e1').should_have_fired, 1);
+
+  db.upsertLabel({ event_id: 'e1', by: 'ingress', note: 'by the pool', at: iso() });
+  const row = db.getLabel('e1');
+  assert.equal(row.actual, 'cat');
+  assert.equal(row.should_have_fired, 1);
+  assert.equal(row.note, 'by the pool');
+
+  db.upsertLabel({ event_id: 'e1', by: 'ingress', should_have_fired: 0, at: iso() });
+  assert.equal(db.getLabel('e1').should_have_fired, 0);
+  db.close();
+});
+
+test('an existing v0.1 database gains should_have_fired in place', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ttds-mig-'));
+  const file = path.join(dir, 'auto-ttds.db');
+  const old = new DatabaseSync(file);
+  old.exec('CREATE TABLE labels (event_id TEXT PRIMARY KEY, by TEXT, correct INTEGER, actual TEXT, friendly INTEGER, note TEXT, at TEXT)');
+  old.prepare('INSERT INTO labels (event_id, by, correct, actual, friendly, note, at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run('old1', 'ingress', 1, 'coyote', 0, 'clear', '2026-09-01T00:00:00.000Z');
+  old.close();
+
+  const db = new Db(file);
+  const row = db.getLabel('old1');
+  assert.equal(row.actual, 'coyote', 'the v0.1 row survives');
+  assert.equal(row.correct, 1, 'the v0.1 columns are untouched');
+  assert.equal(row.should_have_fired, 0, 'correct on an event that never fired means it should not have');
+  assert.equal(db.addColumn('labels', 'should_have_fired', 'INTEGER'), false, 'the migration is idempotent');
+  db.close();
+
+  const reopened = new Db(file); // a second boot must not throw
+  assert.equal(reopened.getLabel('old1').should_have_fired, 0);
+  reopened.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('the upgrade carries v0.1 labels over into should_have_fired', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ttds-backfill-'));
+  const file = path.join(dir, 'auto-ttds.db');
+  const old = new DatabaseSync(file);
+  old.exec('CREATE TABLE labels (event_id TEXT PRIMARY KEY, by TEXT, correct INTEGER, actual TEXT, friendly INTEGER, note TEXT, at TEXT)');
+  old.exec('CREATE TABLE decisions (event_id TEXT PRIMARY KEY, at TEXT, action TEXT, reason TEXT, mode TEXT, knobs_json TEXT)');
+  const label = old.prepare('INSERT INTO labels (event_id, by, correct, actual, friendly, note, at) VALUES (?, ?, ?, ?, ?, ?, ?)');
+  const decision = old.prepare("INSERT INTO decisions (event_id, at, action, reason, mode, knobs_json) VALUES (?, '2026-09-10T00:00:00.000Z', ?, 'target', 'immediate', '{}')");
+  // correct answered "did the system behave correctly", so the answer flips on events that did not fire.
+  const rows = [['f1', 1, 'fire'], ['f0', 0, 'fire'], ['s1', 1, 'skip'], ['s0', 0, 'skip'], ['n1', 1, null], ['u1', null, 'fire']];
+  for (const [id, correct, action] of rows) {
+    label.run(id, 'ingress', correct, 'coyote', 0, `note for ${id}`, '2026-09-10T00:00:00.000Z');
+    if (action) decision.run(id, action);
+  }
+  old.close();
+
+  const db = new Db(file);
+  assert.equal(db.migrations.should_have_fired_backfilled, 5, 'every row with an old answer, and no others');
+  assert.equal(db.getLabel('f1').should_have_fired, 1, 'fired and correct: it should have fired');
+  assert.equal(db.getLabel('f0').should_have_fired, 0, 'fired and wrong: a false spray');
+  assert.equal(db.getLabel('s1').should_have_fired, 0, 'skipped and correct: it should not have fired');
+  assert.equal(db.getLabel('s0').should_have_fired, 1, 'skipped and wrong: a miss');
+  assert.equal(db.getLabel('n1').should_have_fired, 0, 'nothing decided, nothing fired');
+  assert.equal(db.getLabel('u1').should_have_fired, null, 'no old answer, no new one');
+  assert.equal(db.getLabel('f1').note, 'note for f1', 'the notes survive');
+  assert.equal(db.getLabel('f1').correct, 1, 'the old column is left as it was');
+  db.close();
+
+  const second = new Db(file);
+  assert.equal(second.migrations.should_have_fired_backfilled, 0, 'the second boot backfills nothing');
+  second.upsertLabel({ event_id: 'f1', by: 'ingress', should_have_fired: 0, at: '2026-09-17T00:00:00.000Z' });
+  second.close();
+
+  const third = new Db(file);
+  assert.equal(third.getLabel('f1').should_have_fired, 0, 'and never overwrites a later answer');
+  third.close();
+  fs.rmSync(dir, { recursive: true, force: true });
 });
 
 test('deleting test events removes their children and reports their media (review item 16)', () => {

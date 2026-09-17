@@ -25,6 +25,24 @@ export function backoffMs(consecutiveFailures) {
 
 const listKnob = (v) => String(v ?? '').split(',').map((s) => s.trim()).filter(Boolean);
 
+/**
+ * The only two skip reasons a later Ring label may overturn. Ring's push payload carries a
+ * detection_type enum with no animal value, so a push-sourced insert decides on human,
+ * loitering, motion, other_motion or null, and the events API brings the real label minutes
+ * later. Every other reason (person, disabled, not_greenlisted, friendly, cooldown, cap,
+ * program_running, dry_run) stands whatever the label turns out to be.
+ */
+export const REDECIDE_REASONS = new Set(['non_target', 'stale']);
+
+/** The Ring label this decision was made on. Older rows predate the field, so the row is the fallback. */
+function decidedLabel(decision, fallback) {
+  try {
+    const knobs = JSON.parse(decision?.knobs_json ?? '{}');
+    if (Object.prototype.hasOwnProperty.call(knobs, 'decided_label')) return knobs.decided_label;
+  } catch { /* unreadable knobs_json, fall back to the row */ }
+  return fallback;
+}
+
 class App {
   constructor(opts) {
     this.opts = opts;
@@ -50,22 +68,8 @@ class App {
     const id = String(e.event_id);
     const existing = this.db.getEvent(id);
 
-    // Review item 3: a push-first row has no Ring timestamp or recording status. The poll pass fills
-    // those in. It does not decide again, because the push already did.
     if (existing) {
-      if (existing.source === 'push' && !existing.ring_created_at) {
-        const fresh = eventRow(camera, e, 'push', existing.first_seen_at);
-        this.db.updateEvent(id, {
-          camera_name: fresh.camera_name,
-          ring_created_at: fresh.ring_created_at,
-          kind: fresh.kind ?? existing.kind,
-          ring_label: fresh.ring_label ?? existing.ring_label,
-          ring_labels_json: fresh.ring_labels_json,
-          recording_status: fresh.recording_status,
-          raw_json: fresh.raw_json,
-        });
-        log.info(`event ${id} enriched from the poll pass (push arrived first)`);
-      }
+      await this.enrich(existing, camera, e);
       return;
     }
 
@@ -82,7 +86,10 @@ class App {
     if (isStale(row, { now: Date.now(), processStartedAt: this.startedAt, staleAfterS: this.opts.stale_after_s })) {
       const decision = {
         event_id: id, at: nowIso(), action: 'skip', reason: 'stale', mode: this.knobs().mode,
-        knobs_json: JSON.stringify({ started_at: this.startedAt, ring_created_at: row.ring_created_at, stale_after_s: this.opts.stale_after_s }),
+        knobs_json: JSON.stringify({
+          started_at: this.startedAt, ring_created_at: row.ring_created_at,
+          stale_after_s: this.opts.stale_after_s, decided_label: row.ring_label ?? null,
+        }),
       };
       this.db.upsertDecision(decision);
       await this.ha.fireEvent('auto_ttds_decision', decision);
@@ -93,20 +100,77 @@ class App {
     await this.runDecision(id);
   }
 
+  /**
+   * enrich: the poll pass carries what a push cannot. Review item 3 kept the push row's provenance
+   * and first_seen_at; v0.2 also re-decides when the label the decision was made on is not the label
+   * the row now holds, because a push-sourced insert can only ever have seen a non-animal label
+   * (see REDECIDE_REASONS). The check is against decisions.decided_label rather than against this
+   * pass's own diff, so a row stranded by an earlier version heals on the next poll that sees it.
+   */
+  async enrich(existing, camera, e) {
+    const id = String(existing.event_id);
+    const fresh = eventRow(camera, e, existing.source, existing.first_seen_at);
+    const next = {
+      camera_name: fresh.camera_name ?? existing.camera_name,
+      ring_created_at: fresh.ring_created_at ?? existing.ring_created_at,
+      kind: fresh.kind ?? existing.kind,
+      ring_label: fresh.ring_label ?? existing.ring_label,
+      ring_labels_json: fresh.ring_labels_json,
+      recording_status: fresh.recording_status ?? existing.recording_status,
+      raw_json: fresh.raw_json,
+    };
+    const patch = Object.fromEntries(Object.entries(next).filter(([k, v]) => (v ?? null) !== (existing[k] ?? null)));
+    if (Object.keys(patch).length) {
+      this.db.updateEvent(id, patch);
+      log.info(`event ${id} enriched from the poll pass (${Object.keys(patch).join(', ')})`);
+    }
+
+    const before = existing.ring_label ?? null;
+    const after = next.ring_label ?? null;
+    if (String(before ?? '') !== String(after ?? '') && String(after ?? '').toLowerCase() === 'human') {
+      await this.stopIfPerson({ camera_id: existing.camera_id, ring_label: 'human' });
+    }
+    return this.redecide(id, before, after);
+  }
+
+  /**
+   * redecide: the label that arrived late gets the decision it would have got at insert. Only a
+   * skip for non_target or stale is eligible, only when nothing has run for the event, and only
+   * while the event is still fresh enough to be worth water. Enrichment on its own still decides
+   * nothing: the comparison is against the label the decision itself was made on, which for a row
+   * written before decided_label existed falls back to the label the row already held.
+   */
+  async redecide(eventId, before, after) {
+    const decision = this.db.getDecision(eventId);
+    if (!decision || decision.action !== 'skip' || !REDECIDE_REASONS.has(decision.reason)) return false;
+    if (String(decidedLabel(decision, before) ?? '') === String(after ?? '')) return false;
+    if (this.db.runsForEvent(eventId).length) return false; // an event still runs at most once
+    const event = this.db.getEvent(eventId);
+    if (isStale(event, { now: Date.now(), processStartedAt: this.startedAt, staleAfterS: this.opts.stale_after_s })) {
+      log.info(`event ${eventId} is now labeled ${after ?? 'none'} but is too old to act on; the skip stands`);
+      return false;
+    }
+    log.info(`event ${eventId} relabeled ${before ?? 'none'} to ${after ?? 'none'}; deciding again after skip/${decision.reason}`);
+    await this.runDecision(eventId, { redecidedFrom: decision.reason });
+    return true;
+  }
+
   async handlePush(camera, notification) {
     const ding = notification?.data?.event?.ding ?? {};
     const id = ding.id === undefined || ding.id === null ? null : String(ding.id);
     this.db.insertPush({ received_at: nowIso(), camera_id: String(camera.id), raw_json: JSON.stringify(notification) });
     log.info(`push ${camera.name} category=${notification?.android_config?.category ?? '-'} detection=${ding.detection_type ?? '-'}`);
     if (!id) return;
-    const known = this.db.hasEvent(id);
+    const existing = this.db.getEvent(id);
+    const known = Boolean(existing);
     this.db.upsertEvent({
       event_id: id,
       camera_id: String(camera.id),
       camera_name: camera.name ?? null,
       first_seen_at: known ? undefined : nowIso(),
       source: known ? undefined : 'push',
-      ring_label: ding.detection_type ?? undefined,
+      // The push enum has no animal value, so it must never overwrite a label the poll already has.
+      ring_label: existing?.ring_label ?? ding.detection_type ?? undefined,
       kind: ding.subtype ?? undefined,
       test: this.knobs().test_mode ? 1 : 0,
     });
@@ -123,12 +187,16 @@ class App {
   }
 
   // ---- decision (spec 6.2, 6.5, 7) --------------------------------------
-  async runDecision(eventId) {
-    const event = this.db.getEvent(eventId);
-    if (!event) return;
+  async runDecision(eventId, { redecidedFrom = null } = {}) {
     // Review item 12: 14 state reads, so the README claim that a knob change needs no restart and
     // takes effect on the next decision is literally true. The 30 s loop still feeds the page.
     await this.knobStore.refresh();
+    // The row is read after that await, never before: an enrichment landing while the knobs were
+    // being fetched would otherwise be overwritten by a decision made on the label it replaced, and
+    // the event would sit unfired with no later poll able to notice. No await stands between this
+    // read and upsertDecision on any skip path.
+    const event = this.db.getEvent(eventId);
+    if (!event) return;
     const knobs = this.knobs();
     const verdictRow = this.db.getVerdict(eventId);
     const verdict = verdictRow && !verdictRow.error
@@ -153,7 +221,15 @@ class App {
       action: result.action,
       reason: result.reason,
       mode: result.mode,
-      knobs_json: JSON.stringify({ ...knobs, would_suppress: result.wouldSuppress, dry_run: result.dryRun, test: result.test, valves }),
+      knobs_json: JSON.stringify({
+        ...knobs,
+        would_suppress: result.wouldSuppress,
+        dry_run: result.dryRun,
+        test: result.test,
+        valves,
+        decided_label: event.ring_label ?? null,
+        ...(redecidedFrom ? { redecided: true, previous_reason: redecidedFrom } : {}),
+      }),
     };
     this.db.upsertDecision(decision);
     if (result.test) this.db.updateEvent(eventId, { test: 1 });
@@ -364,6 +440,8 @@ class App {
       dataDir: this.opts.data_dir,
     });
     if (migrated.ran) log.info(`migration: ${migrated.events} new events, ${migrated.skipped} already present, ${migrated.clips} clips copied`);
+    const backfilled = this.db.migrations?.should_have_fired_backfilled ?? 0;
+    if (backfilled) log.info(`schema upgrade: ${backfilled} v0.1 label(s) carried over into should_have_fired`);
 
     await this.knobStore.refresh();
 

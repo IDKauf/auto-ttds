@@ -23,8 +23,12 @@ CREATE TABLE IF NOT EXISTS runs (
   -- runs.stopped_by: duration | person | manual | shutdown | null
   requested_s INTEGER, called_at TEXT, http_ms INTEGER, http_status INTEGER, confirmed_at TEXT,
   cleared_at TEXT, stopped_by TEXT, error TEXT, dry_run INTEGER);
+-- labels.correct and labels.friendly are the v0.1 columns. v0.2 replaced them with two independent
+-- labels: actual (what the animal was) and should_have_fired (1 yes, 0 no, NULL unset). The old
+-- columns stay so rows written by v0.1 survive.
 CREATE TABLE IF NOT EXISTS labels (
-  event_id TEXT PRIMARY KEY, by TEXT, correct INTEGER, actual TEXT, friendly INTEGER, note TEXT, at TEXT);
+  event_id TEXT PRIMARY KEY, by TEXT, correct INTEGER, actual TEXT, friendly INTEGER, note TEXT, at TEXT,
+  should_have_fired INTEGER);
 CREATE TABLE IF NOT EXISTS pushes (
   id INTEGER PRIMARY KEY AUTOINCREMENT, received_at TEXT, camera_id TEXT, raw_json TEXT);
 CREATE TABLE IF NOT EXISTS costs (
@@ -42,6 +46,8 @@ const EVENT_COLS = ['event_id', 'camera_id', 'camera_name', 'ring_created_at', '
 
 const VERDICT_COLS = ['event_id', 'model', 'species', 'count', 'is_person', 'friendly', 'confidence',
   'frames_agree', 'raw_json', 'input_tokens', 'output_tokens', 'usd', 'latency_ms', 'at', 'error'];
+
+const LABEL_COLS = ['event_id', 'by', 'correct', 'actual', 'friendly', 'note', 'at', 'should_have_fired'];
 
 const RUN_COLS = ['event_id', 'valve_id', 'valve_name', 'requested_s', 'called_at', 'http_ms',
   'http_status', 'confirmed_at', 'cleared_at', 'stopped_by', 'error', 'dry_run'];
@@ -109,6 +115,36 @@ export class Db {
     this.sql = new DatabaseSync(file ?? ':memory:');
     this.sql.exec('PRAGMA journal_mode = WAL;');
     this.sql.exec(SCHEMA);
+    this.migrations = this.migrate();
+  }
+
+  /** Columns added after v0.1. Idempotent: a PRAGMA check first, so an upgrade needs no dump. */
+  migrate() {
+    const added = this.addColumn('labels', 'should_have_fired', 'INTEGER');
+    return { should_have_fired_backfilled: added ? this.backfillShouldHaveFired() : 0 };
+  }
+
+  /**
+   * v0.1 labels.correct answered one question: did the system behave correctly. So on an event that
+   * fired, correct = 1 means it should have fired; on an event that did not fire, correct = 0 means
+   * it should have fired. Runs once, on the upgrade that adds the column, and only over rows that
+   * carry the old answer and not the new one, so Ian's existing judgements stay in the metrics and
+   * the CSV. Returns the number of rows backfilled.
+   */
+  backfillShouldHaveFired() {
+    const res = this.run(
+      `UPDATE labels SET should_have_fired = CASE
+         WHEN (SELECT d.action FROM decisions d WHERE d.event_id = labels.event_id) = 'fire'
+           THEN correct ELSE 1 - correct END
+       WHERE should_have_fired IS NULL AND correct IS NOT NULL`,
+    );
+    return Number(res.changes ?? 0);
+  }
+
+  addColumn(table, column, type) {
+    const present = this.all(`PRAGMA table_info(${table})`).some((c) => c.name === column);
+    if (!present) this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+    return !present;
   }
 
   close() { try { this.sql.close(); } catch { /* already closed */ } }
@@ -255,12 +291,18 @@ export class Db {
   activeRuns() { return this.all('SELECT * FROM runs WHERE cleared_at IS NULL AND dry_run = 0 AND error IS NULL'); }
 
   // ---- labels / pushes / costs -----------------------------------------
+  /**
+   * Write only the keys the caller supplied, so the two labels (actual and should_have_fired) can
+   * be set in separate requests without one clearing the other.
+   */
   upsertLabel(row) {
+    const present = LABEL_COLS.filter((c) => row[c] !== undefined);
+    if (!present.includes('event_id')) return;
+    const updates = upserts(present, 'event_id');
     this.run(
-      `INSERT INTO labels (event_id, by, correct, actual, friendly, note, at) VALUES (?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(event_id) DO UPDATE SET by=excluded.by, correct=excluded.correct, actual=excluded.actual,
-       friendly=excluded.friendly, note=excluded.note, at=excluded.at`,
-      row.event_id, row.by, row.correct, row.actual, row.friendly, row.note, row.at,
+      `INSERT INTO labels (${cols(present)}) VALUES (${marks(present)})
+       ${updates ? `ON CONFLICT(event_id) DO UPDATE SET ${updates}` : 'ON CONFLICT(event_id) DO NOTHING'}`,
+      ...present.map((c) => bind(row[c])),
     );
   }
 
@@ -318,12 +360,14 @@ export class Db {
     if (filters.action) { where.push('d.action = ?'); args.push(String(filters.action)); }
     if (filters.test === 'only') where.push('e.test = 1');
     if (filters.test === 'hide') where.push('e.test = 0');
-    if (filters.unlabeled) where.push('l.event_id IS NULL');
+    // Unlabeled means no answer to "should it have fired" yet, whether or not a label row exists.
+    if (filters.unlabeled) where.push('l.should_have_fired IS NULL');
     const limit = Math.min(1000, Math.max(1, Number(filters.limit) || 200));
     return this.all(
       `SELECT e.*, d.action, d.reason, d.mode, d.knobs_json, d.at AS decided_at,
               v.species, v.confidence, v.is_person, v.friendly AS verdict_friendly, v.usd, v.error AS verdict_error,
-              l.correct, l.actual, l.friendly AS label_friendly, l.note,
+              l.correct, l.actual, l.friendly AS label_friendly, l.note, l.should_have_fired,
+              (l.event_id IS NOT NULL) AS labeled,
               (SELECT COUNT(*) FROM runs r WHERE r.event_id = e.event_id) AS run_count,
               (SELECT COUNT(*) FROM runs r WHERE r.event_id = e.event_id AND r.confirmed_at IS NOT NULL) AS run_confirmed,
               (SELECT MIN(r.called_at) FROM runs r WHERE r.event_id = e.event_id) AS run_called_at,
@@ -376,19 +420,23 @@ export class Db {
     return rows.map((r) => (Date.parse(r.confirmed_at) - Date.parse(r.first_seen_at)) / 1000).filter((n) => Number.isFinite(n) && n >= 0);
   }
 
-  /** Label-derived quality, split day and night (spec 8.1). Night is 20:00 to 05:59 local. */
+  /**
+   * Label-derived quality, split day and night (spec 8.1). Night is 20:00 to 05:59 local.
+   * Both rates come from labels.should_have_fired alone, and an event with no answer to that
+   * question is in neither numerator nor denominator. fired and skipped are the denominators.
+   */
   labelRates() {
     const rows = this.all(
-      `SELECT l.correct, d.action, e.ring_created_at FROM labels l
+      `SELECT l.should_have_fired, d.action, e.ring_created_at FROM labels l
        LEFT JOIN decisions d ON d.event_id = l.event_id
-       LEFT JOIN events e ON e.event_id = l.event_id WHERE l.correct IS NOT NULL`,
+       LEFT JOIN events e ON e.event_id = l.event_id WHERE l.should_have_fired IS NOT NULL`,
     );
     const buckets = { day: { fired: 0, falseSpray: 0, skipped: 0, missed: 0 }, night: { fired: 0, falseSpray: 0, skipped: 0, missed: 0 } };
     for (const r of rows) {
       const hour = localHourOf(r.ring_created_at ?? Date.now());
       const b = buckets[isNightHour(hour) ? 'night' : 'day'];
-      if (r.action === 'fire') { b.fired += 1; if (r.correct === 0) b.falseSpray += 1; }
-      else { b.skipped += 1; if (r.correct === 0) b.missed += 1; }
+      if (r.action === 'fire') { b.fired += 1; if (r.should_have_fired === 0) b.falseSpray += 1; }
+      else { b.skipped += 1; if (r.should_have_fired === 1) b.missed += 1; }
     }
     const rate = (n, d) => (d ? n / d : null);
     return {

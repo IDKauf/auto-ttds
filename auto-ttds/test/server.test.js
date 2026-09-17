@@ -66,34 +66,69 @@ test('GET /api/metrics carries the tiles and the chart series', async () => {
   });
 });
 
+const postLabel = (base, body) => fetch(`${base}/api/label`, {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+});
+
 test('POST /api/label stores and returns the label', async () => {
   await withServer(async ({ base, db }) => {
-    const res = await fetch(`${base}/api/label`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ event_id: 'e1', correct: false, actual: 'rabbit', friendly: true, note: 'small' }),
-    });
+    const res = await postLabel(base, { event_id: 'e1', actual: 'rabbit', should_have_fired: 0, note: 'small' });
     assert.equal(res.status, 200);
     const body = await res.json();
-    assert.equal(body.label.correct, 0);
+    assert.equal(body.label.should_have_fired, 0);
     assert.equal(db.getLabel('e1').actual, 'rabbit');
-    assert.equal(db.getLabel('e1').friendly, 1);
+    assert.equal(db.getLabel('e1').note, 'small');
 
     const bad = await fetch(`${base}/api/label`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
     assert.equal(bad.status, 400);
   });
 });
 
+test('the two labels are posted independently', async () => {
+  await withServer(async ({ base, db }) => {
+    await postLabel(base, { event_id: 'e1', actual: 'cat', note: null });
+    assert.equal(db.getLabel('e1').should_have_fired, null, 'a species alone leaves the question open');
+
+    await postLabel(base, { event_id: 'e1', should_have_fired: 1 });
+    assert.equal(db.getLabel('e1').actual, 'cat', 'the yes button does not clear the species');
+    assert.equal(db.getLabel('e1').should_have_fired, 1);
+
+    await postLabel(base, { event_id: 'e1', actual: '  bobcat  ', note: ' by the pool ' });
+    const row = db.getLabel('e1');
+    assert.equal(row.actual, 'bobcat', 'whitespace is trimmed');
+    assert.equal(row.note, 'by the pool');
+    assert.equal(row.should_have_fired, 1, 'the text fields do not clear the answer');
+
+    await postLabel(base, { event_id: 'e1', should_have_fired: null });
+    assert.equal(db.getLabel('e1').should_have_fired, null, 'the answer can be unset again');
+
+    await postLabel(base, { event_id: 'e1', actual: '' });
+    assert.equal(db.getLabel('e1').actual, null, 'a blank species clears it');
+  });
+});
+
+test('an unlabeled filter means no should_have_fired answer', async () => {
+  await withServer(async ({ base, db }) => {
+    await postLabel(base, { event_id: 'e1', actual: 'cat' });
+    let rows = await (await fetch(`${base}/api/events?unlabeled=1`)).json();
+    assert.equal(rows.events.length, 1, 'a species alone still counts as unlabeled');
+    await postLabel(base, { event_id: 'e1', should_have_fired: 1 });
+    rows = await (await fetch(`${base}/api/events?unlabeled=1`)).json();
+    assert.equal(rows.events.length, 0);
+    assert.equal(db.getLabel('e1').should_have_fired, 1);
+  });
+});
+
 test('labels export as CSV', async () => {
   await withServer(async ({ base, db }) => {
-    db.upsertLabel({ event_id: 'e1', by: 'ingress', correct: 0, actual: 'rabbit, small', friendly: 1, note: null, at: iso() });
+    db.upsertLabel({ event_id: 'e1', by: 'ingress', should_have_fired: 0, actual: 'rabbit, small', note: null, at: iso() });
     const res = await fetch(`${base}/api/export/labels.csv`);
     assert.equal(res.status, 200);
     assert.match(res.headers.get('content-disposition'), /labels\.csv/);
     const text = await res.text();
     const lines = text.trim().split('\n');
-    assert.equal(lines[0], 'event_id,at,camera_name,ring_created_at,ring_label,species,confidence,correct,actual,friendly,note');
-    assert.match(lines[1], /"rabbit, small"/);
+    assert.equal(lines[0], 'event_id,at,camera_name,ring_created_at,ring_label,species,confidence,should_have_fired,actual,note');
+    assert.match(lines[1], /,0,"rabbit, small",/);
   });
 });
 
@@ -162,6 +197,17 @@ test('the page pauses its table refresh while a label is being typed (review ite
   // The metrics fetch happens before the guard, so the tiles keep updating.
   const guardAt = html.indexOf('if (!force && rowsBusy())');
   assert.ok(html.indexOf("await api('api/metrics')") < guardAt, 'tiles refresh even while the table is paused');
+});
+
+test('the page offers two independent labels and no correct or wrong toggle', () => {
+  const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
+  assert.match(html, /data-actual/);
+  assert.match(html, /data-fired="1"/);
+  assert.match(html, /data-fired="0"/);
+  assert.match(html, /should_have_fired/);
+  assert.ok(!/data-mark/.test(html), 'the old Correct and Wrong toggle is gone');
+  assert.ok(!/data-friendly/.test(html), 'the old friendly checkbox is gone');
+  assert.ok(!/\u2014/.test(html), 'no em dashes in the page');
 });
 
 test('the ingress prefix header is read, and links stay relative', () => {

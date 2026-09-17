@@ -43,8 +43,10 @@ td.mono, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; fo
 .pill.defer { background: var(--warn); border-color: var(--warn); color: #fff; }
 .thumbs { display: flex; gap: 4px; }
 .thumbs img { width: 52px; height: 30px; object-fit: cover; border-radius: 4px; border: 1px solid var(--line); cursor: pointer; }
-.labelbox { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.labelbox { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; max-width: 340px; }
 .labelbox input[type=text] { width: 96px; }
+.labelbox .cap { color: var(--muted); font-size: 11px; }
+.labelbox button { padding: 4px 9px; }
 .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
 .chart h3 { font-size: 13px; margin: 0 0 6px; color: var(--muted); font-weight: 600; }
 svg { width: 100%; height: 130px; display: block; }
@@ -139,9 +141,10 @@ function renderTiles(m) {
     ['Spend this month', '$' + num(m.spend_month_usd, 4), (m.calls_month || 0) + ' classifier calls'],
     ['Push status', pushText, m.push_last_at ? 'last ' + localTime(m.push_last_at) : 'poll is the live path'],
     ['Clip delay median', m.clip_delay_median_s === null ? '-' : num(m.clip_delay_median_s, 0) + ' s', 'Ring event to clip on disk'],
-    ['False spray, day', pct(r.day.falseSprayRate), (r.day.fired || 0) + ' fired and labeled'],
-    ['False spray, night', pct(r.night.falseSprayRate), (r.night.fired || 0) + ' fired and labeled'],
-    ['Miss rate, day / night', pct(r.day.missRate) + ' / ' + pct(r.night.missRate), 'labeled wrong among skips'],
+    ['False spray, day', pct(r.day.falseSprayRate), (r.day.falseSpray || 0) + ' of ' + (r.day.fired || 0) + ' fired and labeled'],
+    ['False spray, night', pct(r.night.falseSprayRate), (r.night.falseSpray || 0) + ' of ' + (r.night.fired || 0) + ' fired and labeled'],
+    ['Miss rate, day', pct(r.day.missRate), (r.day.missed || 0) + ' of ' + (r.day.skipped || 0) + ' not fired and labeled'],
+    ['Miss rate, night', pct(r.night.missRate), (r.night.missed || 0) + ' of ' + (r.night.skipped || 0) + ' not fired and labeled'],
     ['Events stored', m.events_total, 'all time'],
     ['Health', m.health ? m.health.state : 'unknown', m.health ? ('poll ok: ' + m.health.last_poll_ok) : ''],
   ];
@@ -230,14 +233,21 @@ function frameCells(row) {
   return html + '</div>';
 }
 
+// Two independent labels per event: what the animal actually was, and whether the system should
+// have fired. An unanswered "should have fired" is what "unlabeled" means.
 function labelCell(row) {
   const id = esc(row.event_id);
-  const correct = row.correct;
+  // The species is a starting point, not an answer. It shows whenever no species has been stored,
+  // whatever else the row is labeled with, so answering yes or no never blanks the classifier guess.
+  // An untouched box saves nothing, so actual stays unset; clearing it by hand still saves nothing.
+  const actual = row.actual !== null && row.actual !== undefined ? row.actual : (row.species || '');
+  const fired = row.should_have_fired;
   return '<div class="labelbox" data-event="' + id + '">' +
-    '<button data-mark="1" class="' + (correct === 1 ? 'primary' : '') + '">Correct</button>' +
-    '<button data-mark="0" class="' + (correct === 0 ? 'primary' : '') + '">Wrong</button>' +
-    '<input type="text" data-actual placeholder="actually was" value="' + esc(row.actual || '') + '">' +
-    '<label class="check"><input type="checkbox" data-friendly ' + (row.label_friendly ? 'checked' : '') + '> friendly</label>' +
+    '<span class="cap">was</span>' +
+    '<input type="text" data-actual placeholder="what it was" value="' + esc(actual) + '">' +
+    '<span class="cap">should have fired</span>' +
+    '<button data-fired="1" class="' + (fired === 1 ? 'primary' : '') + '">Yes</button>' +
+    '<button data-fired="0" class="' + (fired === 0 ? 'primary' : '') + '">No</button>' +
     '<input type="text" data-note placeholder="note" value="' + esc(row.note || '') + '">' +
     '<span class="saved" hidden>saved</span></div>';
 }
@@ -268,15 +278,9 @@ function rowsBusy() {
   return rows.querySelector('.labelbox[data-dirty="1"]') !== null;
 }
 
-async function postLabel(box, correct) {
-  const body = {
-    event_id: box.dataset.event,
-    by: 'ingress',
-    correct: correct,
-    actual: box.querySelector('[data-actual]').value.trim() || null,
-    friendly: box.querySelector('[data-friendly]').checked,
-    note: box.querySelector('[data-note]').value.trim() || null,
-  };
+// patch carries only the keys this action changed, so the two labels never overwrite each other.
+async function postLabel(box, patch) {
+  const body = Object.assign({ event_id: box.dataset.event, by: 'ingress' }, patch);
   await api('api/label', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   box.removeAttribute('data-dirty');
   const saved = box.querySelector('.saved');
@@ -285,13 +289,13 @@ async function postLabel(box, correct) {
 }
 
 document.addEventListener('click', async (ev) => {
-  const mark = ev.target.closest('[data-mark]');
+  const mark = ev.target.closest('[data-fired]');
   if (mark) {
     const box = mark.closest('.labelbox');
-    const value = Number(mark.dataset.mark);
-    box.querySelectorAll('[data-mark]').forEach((b) => b.classList.remove('primary'));
+    const value = Number(mark.dataset.fired);
+    box.querySelectorAll('[data-fired]').forEach((b) => b.classList.remove('primary'));
     mark.classList.add('primary');
-    await postLabel(box, value);
+    await postLabel(box, { should_have_fired: value });
     return;
   }
   const img = ev.target.closest('img[data-full]');
@@ -305,11 +309,16 @@ document.addEventListener('input', (ev) => {
   if (box) box.setAttribute('data-dirty', '1');
 });
 
+// Each text field saves on blur on its own. Only the field that changed is sent, so a note never
+// writes the species prefill back as a ground truth nobody typed, and neither touches yes or no.
 document.addEventListener('change', async (ev) => {
   const box = ev.target.closest('.labelbox');
   if (!box) return;
-  const active = box.querySelector('[data-mark].primary');
-  await postLabel(box, active ? Number(active.dataset.mark) : null);
+  const patch = {};
+  if (ev.target.matches('[data-actual]')) patch.actual = ev.target.value.trim() || null;
+  if (ev.target.matches('[data-note]')) patch.note = ev.target.value.trim() || null;
+  if (!Object.keys(patch).length) return;
+  await postLabel(box, patch);
 });
 
 $('viewer-close').addEventListener('click', () => { $('viewer').close(); $('viewer-body').innerHTML = ''; });

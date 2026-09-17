@@ -9,6 +9,7 @@ import path from 'node:path';
 import { App, backoffMs } from '../src/main.js';
 import { Rachio } from '../src/rachio.js';
 import { knobDefaults } from '../src/config.js';
+import { eventRow } from '../src/ring.js';
 import { Db } from '../src/db.js';
 
 const tick = () => new Promise((r) => setImmediate(r));
@@ -292,5 +293,193 @@ test('dry run writes rows and never calls Rachio', async () => {
   assert.equal(runs.length, 2);
   for (const r of runs) assert.equal(r.dry_run, 1);
   assert.deepEqual(calls.filter((c) => c.includes('Watering')), []);
+  cleanup();
+});
+
+// ---- v0.2: Ring's push enum has no animal value, so the label arrives late -----------------
+// A push-sourced insert decides on human, loitering, motion, other_motion or null and records
+// skip/non_target; the events API then enriches ring_label to animal. Before v0.2 that enrichment
+// never re-decided, so whichever path won the insert decided the outcome of identical cat events.
+
+const push = (id, detection) => ({
+  android_config: { category: 'com.ring.motion' },
+  data: { event: { ding: { id, subtype: 'motion', detection_type: detection } } },
+});
+
+test('a late animal label re-decides a push skip and fires exactly once', async () => {
+  const { app, cleanup } = makeApp();
+  app.ring.saveSnapshot = async () => null;
+
+  await app.handlePush(CAM, push('p1', 'other_motion'));
+  await tick();
+  const first = app.db.getDecision('p1');
+  assert.equal(first.action, 'skip');
+  assert.equal(first.reason, 'non_target');
+  assert.equal(app.db.runsForEvent('p1').length, 0);
+  assert.equal(JSON.parse(first.knobs_json).decided_label, 'other_motion');
+
+  await app.handleEvent(CAM, ringEvent('p1')); // the events API brings cv_properties.animal
+  await tick();
+  const after = app.db.getDecision('p1');
+  assert.equal(after.action, 'fire');
+  assert.equal(after.reason, 'target');
+  assert.equal(app.db.get('SELECT COUNT(*) AS n FROM decisions WHERE event_id = ?', 'p1').n, 1,
+    'the decision row is updated in place, not duplicated');
+  const knobs = JSON.parse(after.knobs_json);
+  assert.equal(knobs.redecided, true);
+  assert.equal(knobs.previous_reason, 'non_target');
+  assert.equal(knobs.decided_label, 'animal');
+  assert.equal(app.db.runsForEvent('p1').length, 2, 'one run per valve, once');
+
+  // A later poll pass that changes something other than the label enriches and stops there.
+  await app.handleEvent(CAM, ringEvent('p1', { recording_status: 'audio_ready' }));
+  await tick();
+  assert.equal(app.db.getEvent('p1').recording_status, 'audio_ready');
+  assert.equal(app.db.runsForEvent('p1').length, 2, 'an unchanged label never fires again');
+  assert.equal(app.db.getDecision('p1').at, after.at, 'and never rewrites the decision');
+  cleanup();
+});
+
+test('an event that already ran is never re-decided into a second run', async () => {
+  const { app, cleanup } = makeApp();
+  app.ring.saveSnapshot = async () => null;
+  await app.handlePush(CAM, push('p2', 'other_motion'));
+  await tick();
+  app.db.insertRun({ event_id: 'p2', valve_id: 'v1', requested_s: 60, called_at: iso(), dry_run: 0 });
+
+  await app.handleEvent(CAM, ringEvent('p2'));
+  await tick();
+  const decision = app.db.getDecision('p2');
+  assert.equal(decision.action, 'skip');
+  assert.equal(decision.reason, 'non_target');
+  assert.equal(app.db.runsForEvent('p2').length, 1, 'the existing run is the only run');
+  assert.equal(app.db.getEvent('p2').ring_label, 'animal', 'the row is still enriched');
+  cleanup();
+});
+
+test('a skip for person is never re-decided by a later label', async () => {
+  const { app, calls, cleanup } = makeApp();
+  app.ring.saveSnapshot = async () => null;
+  await app.handlePush(CAM, push('p3', 'human'));
+  await tick();
+  assert.equal(app.db.getDecision('p3').reason, 'person');
+
+  await app.handleEvent(CAM, ringEvent('p3'));
+  await tick();
+  const decision = app.db.getDecision('p3');
+  assert.equal(decision.action, 'skip');
+  assert.equal(decision.reason, 'person');
+  assert.equal(JSON.parse(decision.knobs_json).redecided, undefined);
+  assert.equal(app.db.runsForEvent('p3').length, 0);
+  assert.deepEqual(calls, [], 'a person skip costs no Rachio call either');
+  cleanup();
+});
+
+test('a skip the label cannot explain away is left alone', async () => {
+  const { app, cleanup } = makeApp({ enabled: false });
+  app.ring.saveSnapshot = async () => null;
+  await app.handlePush(CAM, push('p4', 'other_motion'));
+  await tick();
+  assert.equal(app.db.getDecision('p4').reason, 'disabled');
+
+  await app.handleEvent(CAM, ringEvent('p4'));
+  await tick();
+  assert.equal(app.db.getDecision('p4').reason, 'disabled');
+  assert.equal(app.db.runsForEvent('p4').length, 0);
+  cleanup();
+});
+
+test('a relabeled event that is already stale keeps its skip', async () => {
+  const { app, calls, cleanup } = makeApp();
+  app.ring.saveSnapshot = async () => null;
+  await app.handlePush(CAM, push('p5', 'other_motion'));
+  await tick();
+
+  const old = new Date(Date.now() - 6 * 3600 * 1000).toISOString();
+  await app.handleEvent(CAM, ringEvent('p5', { created_at: old }));
+  await tick();
+  assert.equal(app.db.getEvent('p5').ring_label, 'animal');
+  assert.equal(app.db.getDecision('p5').reason, 'non_target', 'water is pointless six hours later');
+  assert.equal(app.db.runsForEvent('p5').length, 0);
+  assert.deepEqual(calls, []);
+  cleanup();
+});
+
+test('a push arriving after the poll never downgrades the Ring label', async () => {
+  const { app, cleanup } = makeApp();
+  app.ring.saveSnapshot = async () => null;
+  await app.handleEvent(CAM, ringEvent('p6'));
+  await tick();
+  assert.equal(app.db.getDecision('p6').action, 'fire');
+
+  await app.handlePush(CAM, push('p6', 'other_motion'));
+  await tick();
+  assert.equal(app.db.getEvent('p6').ring_label, 'animal', 'the push enum has no animal value to offer');
+  assert.equal(app.db.runsForEvent('p6').length, 2, 'and it starts nothing new');
+  cleanup();
+});
+
+test('an enrichment landing mid decision leaves the event fired, not stranded', async () => {
+  const { app, cleanup } = makeApp();
+  app.ring.saveSnapshot = async () => null;
+  // The knob refresh is the await inside runDecision. Enriching during it is the race: the push
+  // path must not come back and write a skip based on the label the poll has already replaced.
+  const refresh = app.knobStore.refresh;
+  let armed = true;
+  app.knobStore.refresh = async () => {
+    const out = await refresh();
+    if (armed) { armed = false; await app.handleEvent(CAM, ringEvent('r1')); }
+    return out;
+  };
+
+  await app.handlePush(CAM, push('r1', 'other_motion'));
+  await tick();
+  await tick();
+
+  assert.equal(app.db.getEvent('r1').ring_label, 'animal');
+  const decision = app.db.getDecision('r1');
+  assert.equal(decision.action, 'fire', 'the decision is made on the label the row actually holds');
+  assert.equal(JSON.parse(decision.knobs_json).decided_label, 'animal');
+  assert.equal(app.db.runsForEvent('r1').length, 2);
+  cleanup();
+});
+
+test('a row stranded by an earlier version heals on the next poll that sees it', async () => {
+  const { app, cleanup } = makeApp();
+  // The shape v0.2.0 could leave behind: the label is already animal, the decision still says it
+  // was made on other_motion, and nothing has run. This poll pass brings no new field at all.
+  const polled = ringEvent('s1');
+  const row = eventRow(CAM, polled, 'push', iso(-5000));
+  app.db.insertEvent(row);
+  app.db.upsertDecision({
+    event_id: 's1', at: iso(-4000), action: 'skip', reason: 'non_target', mode: 'immediate',
+    knobs_json: JSON.stringify({ decided_label: 'other_motion' }),
+  });
+
+  await app.handleEvent(CAM, polled);
+  await tick();
+  const decision = app.db.getDecision('s1');
+  assert.equal(decision.action, 'fire');
+  const knobs = JSON.parse(decision.knobs_json);
+  assert.equal(knobs.redecided, true);
+  assert.equal(knobs.previous_reason, 'non_target');
+  assert.equal(app.db.runsForEvent('s1').length, 2);
+  cleanup();
+});
+
+test('a decision made on the label the row still holds is left alone', async () => {
+  const { app, calls, cleanup } = makeApp();
+  const polled = ringEvent('s2', { cv_properties: { detection_type: 'other_motion', detection_types: [] } });
+  app.db.insertEvent(eventRow(CAM, polled, 'poll', iso(-5000)));
+  app.db.upsertDecision({
+    event_id: 's2', at: iso(-4000), action: 'skip', reason: 'non_target', mode: 'immediate',
+    knobs_json: JSON.stringify({ decided_label: 'other_motion' }),
+  });
+
+  await app.handleEvent(CAM, polled);
+  await tick();
+  assert.equal(app.db.getDecision('s2').reason, 'non_target');
+  assert.equal(app.db.runsForEvent('s2').length, 0);
+  assert.deepEqual(calls, [], 'a poll pass that brings nothing new costs nothing');
   cleanup();
 });
