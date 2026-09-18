@@ -66,6 +66,28 @@ test('GET /api/metrics carries the tiles and the chart series', async () => {
   });
 });
 
+test('GET /api/metrics carries the water tiles, and flow stays unreported (v0.3)', async () => {
+  await withServer(async ({ base, db }) => {
+    let m = await (await fetch(`${base}/api/metrics`)).json();
+    for (const key of ['valve_seconds_today', 'valve_seconds_7d', 'valve_runs_today', 'valve_runs_7d', 'events_fired_today', 'flow_7d']) {
+      assert.ok(key in m, `metrics has ${key}`);
+    }
+    assert.equal(m.valve_seconds_today, 0);
+    assert.equal(m.events_fired_today, 0);
+    assert.equal(m.flow_7d.reported, false);
+
+    const at = iso(-30000);
+    db.insertRun({ event_id: 'e1', valve_id: 'v1', requested_s: 60, called_at: at, dry_run: 0, confirmed_at: at, cleared_at: iso(-20000) });
+    db.insertRun({ event_id: 'e1', valve_id: 'v2', requested_s: 60, called_at: at, dry_run: 0 });
+    m = await (await fetch(`${base}/api/metrics`)).json();
+    assert.equal(m.valve_seconds_today, 70, 'one timed run of 10 s plus one that only asked for 60');
+    assert.equal(m.valve_runs_today, 2);
+    assert.equal(m.events_fired_today, 1, 'two valves, one event');
+    assert.equal(m.flow_7d.reported, false, 'the timer sends no flow field, so nothing is claimed');
+    assert.equal(m.flow_7d.unknown, 2);
+  });
+});
+
 const postLabel = (base, body) => fetch(`${base}/api/label`, {
   method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
 });
@@ -197,6 +219,29 @@ test('the page pauses its table refresh while a label is being typed (review ite
   // The metrics fetch happens before the guard, so the tiles keep updating.
   const guardAt = html.indexOf('if (!force && rowsBusy())');
   assert.ok(html.indexOf("await api('api/metrics')") < guardAt, 'tiles refresh even while the table is paused');
+});
+
+test('the page shows the water figures for what they are (v0.3)', () => {
+  const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
+  assert.match(html, /Valve seconds today/);
+  assert.match(html, /Valve seconds, 7 days/);
+  assert.match(html, /Events fired today/);
+  assert.match(html, /valve open time, not measured water/);
+  assert.match(html, /not reported/, 'the flow tile says so while nothing reports flow');
+  assert.match(html, /nothing here is measured water/);
+  // The run cell carries requested seconds, confirmation and flow when it is known.
+  assert.match(html, /run_requested_s/);
+  assert.match(html, /run_flow/);
+  assert.match(html, /confirmed /);
+  // The Run column is visible at phone width, because that is where the water facts live.
+  assert.ok(!/<th class="hide">Run<\/th>/.test(html));
+  assert.ok(!/data-h="Run" class="hide"/.test(html));
+});
+
+test('the page has no defer action left to show (v0.3)', () => {
+  const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
+  assert.ok(!/defer/.test(html), 'nothing defers any more: a decision waits for the classifier');
+  assert.match(html, /waiting on the classifier/);
 });
 
 test('the page offers two independent labels and no correct or wrong toggle', () => {

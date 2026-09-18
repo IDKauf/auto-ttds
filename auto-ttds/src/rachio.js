@@ -18,6 +18,52 @@ export function readRachioKey(envFile) {
 
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * detectFlow is the valve's capability flag, not a reading. All three valves report it false today,
+ * so treating it as a measurement would record "no water moved" on every run when the honest answer
+ * is that nothing was measured.
+ */
+export const FLOW_CAPABILITY_KEYS = ['detectflow', 'flowdetectionenabled', 'hasflowmeter'];
+
+/** A flow value, as 1, 0 or null. Strings and numbers are accepted because the shape is unknown. */
+function flowValue(v) {
+  if (v === true) return 1;
+  if (v === false) return 0;
+  if (typeof v === 'number') return Number.isFinite(v) ? (v > 0 ? 1 : 0) : null;
+  if (typeof v === 'string') {
+    const s = v.trim().toLowerCase();
+    if (s === 'true' || s === 'yes' || s === 'detected') return 1;
+    if (s === 'false' || s === 'no' || s === 'none' || s === 'not_detected') return 0;
+    const n = Number(s);
+    return Number.isFinite(n) && s !== '' ? (n > 0 ? 1 : 0) : null;
+  }
+  return null;
+}
+
+/**
+ * flowDetectedFrom: 1, 0 or null for one valve's getValve payload.
+ *
+ * Verified 2026-09-16: the Smart Hose Timer has an integrated flow meter, every valve reports
+ * detectFlow false, and the valve state carries no flow or volume field at all. So this returns
+ * null today, which is what "not reported" on the page means. It is written as a search rather than
+ * a fixed path on purpose: the day Rachio starts sending a flow field, under whatever name, the
+ * column starts filling in with no code change.
+ */
+export function flowDetectedFrom(valve) {
+  const scopes = [valve?.state?.reportedState?.lastWateringAction, valve?.state?.reportedState, valve?.state, valve];
+  for (const scope of scopes) {
+    if (!scope || typeof scope !== 'object') continue;
+    for (const [key, raw] of Object.entries(scope)) {
+      const k = key.toLowerCase();
+      if (!k.includes('flow')) continue;
+      if (FLOW_CAPABILITY_KEYS.includes(k)) continue;
+      const v = flowValue(raw);
+      if (v !== null) return v;
+    }
+  }
+  return null;
+}
+
 export class Rachio {
   constructor({ apiKey, fetchImpl = globalThis.fetch, valveBase = VALVE_BASE, publicBase = PUBLIC_BASE, sleep = sleepMs, now = () => Date.now() } = {}) {
     this.apiKey = apiKey;
@@ -76,11 +122,22 @@ export class Rachio {
     };
   }
 
-  /** Current lastWateringAction for a valve, or null when it is idle (spec 1.5). */
-  async lastWateringAction(valveId) {
+  /**
+   * One getValve, read twice: the watering action that says whether the valve is open, and the flow
+   * reading if the timer ever sends one. -> {action, flow}
+   */
+  async valveSnapshot(valveId) {
     const res = await this.getValve(valveId);
     const valve = res.json?.valve ?? res.json;
-    return valve?.state?.reportedState?.lastWateringAction ?? null;
+    return {
+      action: valve?.state?.reportedState?.lastWateringAction ?? null,
+      flow: flowDetectedFrom(valve),
+    };
+  }
+
+  /** Current lastWateringAction for a valve, or null when it is idle (spec 1.5). */
+  async lastWateringAction(valveId) {
+    return (await this.valveSnapshot(valveId)).action;
   }
 
   /**
@@ -113,6 +170,8 @@ export class Rachio {
     const deadline = this.now() + (durationSeconds + 60) * 1000;
     let confirmedAt = null;
     let clearedAt = null;
+    // The last flow reading the timer gave us during this run, or null when it gave none (v0.3).
+    let flow = null;
     while (this.now() < deadline) {
       await this.sleep(2000);
       const stopReason = hooks.shouldStop?.();
@@ -123,21 +182,22 @@ export class Rachio {
         await this.stopWatering(valveId);
         clearedAt = new Date().toISOString();
         const by = typeof stopReason === 'string' ? stopReason : 'person';
-        hooks.onCleared?.({ cleared_at: clearedAt, stopped_by: by });
-        return { ok: true, status: started.status, confirmedAt, clearedAt, stoppedBy: by };
+        hooks.onCleared?.({ cleared_at: clearedAt, stopped_by: by, flow_detected: flow });
+        return { ok: true, status: started.status, confirmedAt, clearedAt, stoppedBy: by, flow };
       }
-      let action = null;
-      try { action = await this.lastWateringAction(valveId); } catch { continue; }
-      if (action && !confirmedAt) {
+      let snap = null;
+      try { snap = await this.valveSnapshot(valveId); } catch { continue; }
+      if (snap.flow !== null) flow = snap.flow;
+      if (snap.action && !confirmedAt) {
         confirmedAt = new Date().toISOString();
-        hooks.onConfirmed?.({ confirmed_at: confirmedAt });
-      } else if (!action && confirmedAt) {
+        hooks.onConfirmed?.({ confirmed_at: confirmedAt, flow_detected: flow });
+      } else if (!snap.action && confirmedAt) {
         clearedAt = new Date().toISOString();
-        hooks.onCleared?.({ cleared_at: clearedAt, stopped_by: 'duration' });
-        return { ok: true, status: started.status, confirmedAt, clearedAt, stoppedBy: 'duration' };
+        hooks.onCleared?.({ cleared_at: clearedAt, stopped_by: 'duration', flow_detected: flow });
+        return { ok: true, status: started.status, confirmedAt, clearedAt, stoppedBy: 'duration', flow };
       }
     }
-    hooks.onCleared?.({ cleared_at: new Date().toISOString(), stopped_by: null });
-    return { ok: true, status: started.status, confirmedAt, clearedAt: null, stoppedBy: null };
+    hooks.onCleared?.({ cleared_at: new Date().toISOString(), stopped_by: null, flow_detected: flow });
+    return { ok: true, status: started.status, confirmedAt, clearedAt: null, stoppedBy: null, flow };
   }
 }

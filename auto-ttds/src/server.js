@@ -93,11 +93,20 @@ export function buildMetrics(db, extra = {}) {
   const delays = db.clipDelaysSeconds();
   const sorted = delays.slice().sort((a, b) => a - b);
   const medianDelay = sorted.length ? (sorted.length % 2 ? sorted[sorted.length >> 1] : (sorted[(sorted.length >> 1) - 1] + sorted[sorted.length >> 1]) / 2) : null;
+  const valveToday = db.valveSecondsSince(dayStart);
+  const valveWeek = db.valveSecondsSince(weekStart);
   return {
     events_today: db.countSince('events', 'first_seen_at', dayStart),
     events_7d: db.countSince('events', 'first_seen_at', weekStart),
     runs_today: db.countSince('runs', 'called_at', dayStart),
     runs_7d: db.countSince('runs', 'called_at', weekStart),
+    // Water tracking (v0.3). These are valve open time, never measured volume: see flow_7d.
+    valve_seconds_today: valveToday.seconds,
+    valve_seconds_7d: valveWeek.seconds,
+    valve_runs_today: valveToday.runs,
+    valve_runs_7d: valveWeek.runs,
+    events_fired_today: db.eventsFiredSince(dayStart),
+    flow_7d: db.flowSummary(weekStart),
     events_total: db.countEvents(),
     spend_month_usd: db.spendForMonth(month).usd,
     calls_month: db.spendForMonth(month).calls,

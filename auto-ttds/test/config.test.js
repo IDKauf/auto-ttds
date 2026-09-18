@@ -57,7 +57,7 @@ test('knob defaults match the spec 4 table', () => {
   assert.equal(d.test_mode, false);
   assert.equal(d.mode, 'immediate');
   assert.equal(d.camera_greenlist, '639481050,73991832');
-  assert.equal(d.target_labels, 'animal');
+  assert.equal(d.target_labels, '*', 'v0.3: any classified animal fires by default');
   assert.equal(d.friendlies, 'rabbit');
   assert.equal(d.valve_map, '*');
   assert.equal(d.run_seconds, 60);

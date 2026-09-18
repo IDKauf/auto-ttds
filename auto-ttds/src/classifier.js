@@ -41,40 +41,58 @@ export function imageTokens(width, height) {
   return Math.ceil(width / 28) * Math.ceil(height / 28);
 }
 
+/**
+ * The constrained species set (v0.3). The classifier decides whether water runs, so the answer has
+ * to be a value decide() can act on rather than free text. Anything the model wants to add about
+ * the animal goes in detail, which nothing acts on.
+ */
+export const SPECIES = [
+  'person',
+  'none',
+  'animal_unknown',
+  'eyes_unknown',
+  'cat', 'dog', 'raccoon', 'opossum', 'skunk', 'rabbit', 'rat', 'bird', 'deer', 'coyote', 'squirrel',
+];
+
 export const SYSTEM_PROMPT = [
-  'You are looking at still frames from a yard camera at a private home.',
-  'Identify the animal in view. Return only the fields in the schema.',
-  'Do not describe people. If a person is visible, set is_person true and species to "person", and say nothing else about them.',
-  'species is a lowercase common name, or "none" when nothing is in view.',
+  'You are looking at still images from a yard camera at a private home.',
+  'Say what is in view. Return only the fields in the schema.',
+  'species must be one of the allowed values, and nothing else.',
+  'Use "person" when a person is visible. Do not describe people: say nothing else about them.',
+  'Use "none" when no animal is present, for example moving shade, blowing plants, rain, a passing car or an empty yard.',
+  'Use a specific common name only when you can actually tell the species apart.',
+  'Use "animal_unknown" when an animal is clearly present but you cannot tell which species it is.',
+  'Use "eyes_unknown" when all you can see is eyeshine, the bright reflected eyes typical of night infrared.',
+  'Eyeshine at night means an animal is there, so it is never "none".',
+  'Guessing a species you cannot see costs more than answering animal_unknown or eyes_unknown.',
 ].join(' ');
 
-// spec 6.4 schema, used as output_config.format. No tool_choice forcing, no assistant prefill.
+// Structured output schema, used as output_config.format. No tool_choice forcing, no prefill.
+// is_person is not asked for: it is derived from species === 'person'.
 export const VERDICT_SCHEMA = {
   type: 'object',
   properties: {
-    species: { type: 'string', description: 'lowercase common name, "none" if nothing, "person" for people' },
+    species: { type: 'string', enum: SPECIES, description: 'one of the allowed values, nothing else' },
+    detail: { type: 'string', description: 'free text about the animal, at most 160 characters, empty when there is nothing to add' },
     count: { type: 'integer', description: 'how many of that species are visible' },
-    is_person: { type: 'boolean', description: 'true when any person is visible' },
-    friendly: { type: 'boolean', description: 'true when the species is in the friendlies list given in the prompt' },
     confidence: { type: 'number', description: '0 to 1' },
-    evidence: { type: 'string', description: 'at most 160 characters of what the frames show' },
+    evidence: { type: 'string', description: 'at most 160 characters of what the images show' },
   },
-  required: ['species', 'count', 'is_person', 'friendly', 'confidence', 'evidence'],
+  required: ['species', 'detail', 'count', 'confidence', 'evidence'],
   additionalProperties: false,
 };
 
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
-export function buildMessages(images, friendlies) {
+export function buildMessages(images) {
   const content = [];
   images.forEach((img, i) => {
     content.push({ type: 'text', text: `Image ${i + 1}` });
     content.push({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: img } });
   });
-  const friendlyList = (friendlies ?? []).join(', ') || 'none';
   content.push({
     type: 'text',
-    text: `Friendlies list: ${friendlyList}. Set friendly true only when species is on that list. Answer with the schema fields only.`,
+    text: `Allowed species values: ${SPECIES.join(', ')}. Answer with the schema fields only.`,
   });
   return [{ role: 'user', content }];
 }
@@ -103,7 +121,9 @@ export class Classifier {
 
   /**
    * classify(imagePaths, friendlies) -> verdict row for the verdicts table.
-   * On an API error it retries once after 30 s (spec 6.4), then records the error.
+   * On an API error it retries once after 30 s, then records the error.
+   * friendlies is recorded on the row for the page. It is not sent to the model and it is not what
+   * suppresses a run: decide() reads the knob itself.
    */
   async classify(imagePaths, friendlies = []) {
     const images = this.loadImages(imagePaths);
@@ -111,7 +131,8 @@ export class Classifier {
     if (!images.length) {
       return { model: this.model, at, error: 'no frames available', input_tokens: 0, output_tokens: 0, usd: 0, latency_ms: 0 };
     }
-    const messages = buildMessages(images, friendlies);
+    const friendlyList = (friendlies ?? []).map((f) => String(f).trim().toLowerCase());
+    const messages = buildMessages(images);
     const request = {
       model: this.model,
       max_tokens: 400,
@@ -131,21 +152,25 @@ export class Classifier {
         const outTok = res?.usage?.output_tokens ?? 0;
         const priceKey = priceKeyFor(this.model, res?.model); // review item 5
         if (!priceKey) log.warning(`no price row for model ${this.model}; cost recorded as 0`);
+        const species = String(parsed?.species ?? '').trim().toLowerCase() || null;
+        // The classification decides whether water runs, so a species outside the allowed set is an
+        // error rather than a guess to act on. The caller skips with classifier_error.
+        const bad = species && !SPECIES.includes(species) ? `species "${species}" is not in the allowed set` : null;
         return {
           model: res?.model ?? this.model,
-          species: String(parsed?.species ?? '').toLowerCase() || null,
+          species: bad ? null : species,
           count: Number.isFinite(Number(parsed?.count)) ? Number(parsed.count) : null,
-          is_person: parsed?.is_person ? 1 : 0,
-          friendly: parsed?.friendly ? 1 : 0,
+          is_person: species === 'person' ? 1 : 0, // derived, never asked for
+          friendly: species && friendlyList.includes(species) ? 1 : 0,
           confidence: Number.isFinite(Number(parsed?.confidence)) ? Number(parsed.confidence) : null,
-          frames_agree: null, // one call covers all frames in v1, so there is nothing to compare
+          frames_agree: null, // one call covers all images, so there is nothing to compare
           raw_json: JSON.stringify({ verdict: parsed, images: images.length }),
           input_tokens: inTok,
           output_tokens: outTok,
           usd: usdFor(priceKey, inTok, outTok),
           latency_ms: latency,
           at: new Date().toISOString(),
-          error: parsed ? null : 'no JSON in response',
+          error: parsed ? bad : 'no JSON in response',
         };
       } catch (err) {
         lastError = err?.message ?? String(err);

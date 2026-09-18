@@ -1,12 +1,17 @@
-// decide.js: the pure decision function from spec section 7, plus the pure valve-map helper.
+// decide.js: the pure decision function, plus the pure valve-map helper.
 // No I/O, no clock, no globals. Everything it needs arrives in the four arguments.
+//
+// v0.3 moved the classifier in front of the decision. decide() now reads the classifier species and
+// never the Ring label: Ring's own label only decides whether an event is a person, which main.js
+// handles before it spends anything on a classifier call.
 
-// Every reason string the decisions table may hold (spec 5, decisions.reason).
+// Every reason string the decisions table may hold (db.js, decisions.reason).
 export const REASONS = [
   'target',
   'non_target',
   'not_greenlisted',
   'person',
+  'no_animal', // v0.3: the classifier saw no animal, for example moving shade or an empty yard
   'friendly',
   'cooldown',
   'cap',
@@ -15,8 +20,9 @@ export const REASONS = [
   'disabled',
   'dry_run',
   'test',
-  'no_verdict_timeout',
-  'stale', // review item 1: an event older than the backlog window never fires
+  'no_verdict_timeout', // v0.2 slot, kept so old rows still read; v0.3 never emits it
+  'stale', // an event older than the backlog window never fires
+  'classifier_error', // v0.3: no classification means no water, ever
 ];
 
 const ms = (t) => (typeof t === 'number' ? t : Date.parse(t));
@@ -28,7 +34,7 @@ export const DEFAULT_STALE_AFTER_S = 300;
 
 /**
  * isStale: true when an event is old enough that firing on it would be spraying at nothing.
- * Review item 1, cutoff from the stale_after_s add-on option (review 2 item 3).
+ * Cutoff from the stale_after_s add-on option.
  * Two independent rules: older than stale_after_s, or created before this process started.
  */
 export function staleCutoffMs(staleAfterS) {
@@ -47,8 +53,12 @@ export function isStale(event, { now, processStartedAt, staleAfterS } = {}) {
 
 /**
  * decide(event, verdict, knobs, state) -> {action, reason, ...flags}
- * action: 'fire' | 'skip' | 'defer'
- * flags: test, dryRun, wouldSuppress, warnings[]
+ * action: 'fire' | 'skip'
+ * flags: test, dryRun, warnings[]
+ *
+ * verdict is the classifier result. There is no decision without one, so a caller that has no
+ * classification must not call this at all, with one exception: the greenlist check comes first, so
+ * main.js decides a camera off the greenlist with no verdict and pays no classifier bill for it.
  */
 export function decide(event, verdict, knobs, state) {
   const warnings = [];
@@ -61,78 +71,67 @@ export function decide(event, verdict, knobs, state) {
     reason,
     test: Boolean(k.test_mode),
     dryRun: Boolean(k.dry_run),
-    wouldSuppress: 0,
     warnings,
     mode,
     ...extra,
   });
 
-  // spec 7.1: master switch off means log only.
+  // 1: master switch off means log only.
   if (k.enabled === false) return out('skip', 'disabled');
 
-  // spec 7.2: test mode marks the event and continues. The flag rides on every result via out().
+  // 2: test mode marks the event and continues. The flag rides on every result via out().
 
-  // spec 7.3: camera greenlist.
-  // Review item 7: an empty greenlist is not a wildcard. Nothing is green, so nothing fires.
+  // 3: camera greenlist. An empty greenlist is not a wildcard: nothing is green, so nothing fires.
   const green = list(k.camera_greenlist);
   if (!green.includes(String(event?.camera_id ?? '').toLowerCase())) {
     return out('skip', 'not_greenlisted');
   }
 
-  // spec 7.4: people are never a target, from either source.
-  const ringLabel = String(event?.ring_label ?? '').trim().toLowerCase();
-  if (ringLabel === 'human' || verdict?.is_person === true) return out('skip', 'person');
-
-  // spec 7.5: non-target Ring label, when the verdict cannot overrule it yet.
-  const targets = list(k.target_labels);
-  const isTargetLabel = ringLabel !== '' && targets.includes(ringLabel);
-  if (!isTargetLabel && (mode === 'immediate' || !verdict)) return out('skip', 'non_target');
-
-  // spec 7.6 / 6.5: classifier_wait defers until the verdict lands or the wait expires.
-  const timedOut = (now - ms(event?.first_seen_at ?? now)) >= Number(k.classifier_max_wait_s ?? 120) * 1000;
-  let timeoutFire = false;
-  if (mode === 'classifier_wait' && !verdict) {
-    if (!timedOut) return out('defer', 'target');
-    // Timed out with no verdict: fire on the strength of the Ring label alone.
-    timeoutFire = true;
-  }
-
-  // spec 7.7: friendlies suppress in classifier_wait, and are informational in immediate mode.
-  const friendlies = list(k.friendlies);
   const species = String(verdict?.species ?? '').trim().toLowerCase();
-  const isFriendly = verdict ? (verdict.friendly === true || (species !== '' && friendlies.includes(species))) : false;
-  let wouldSuppress = 0;
-  if (isFriendly) {
-    if (mode === 'classifier_wait') return out('skip', 'friendly');
-    wouldSuppress = 1; // immediate mode: recorded in decisions.knobs_json, not a skip
+
+  // 4: people are never a target. is_person is derived from species === 'person'.
+  if (species === 'person' || verdict?.is_person === true) return out('skip', 'person');
+
+  // 5: nothing in the yard, for example moving shade.
+  if (species === 'none') return out('skip', 'no_animal');
+
+  // 6: the friendlies knob is the only source of friendliness. The model is not asked.
+  if (species !== '' && list(k.friendlies).includes(species)) return out('skip', 'friendly');
+
+  // 7: target_labels holds classifier species that fire, or "*" for any animal. Every species that
+  // reaches this line is an animal, animal_unknown and eyes_unknown included. No classification at
+  // all is never a target: an event with no species can never reach fire.
+  const targets = list(k.target_labels);
+  if (!(targets.includes('*') ? species !== '' : targets.includes(species))) {
+    return out('skip', 'non_target');
   }
 
-  // spec 7.8: cooldown.
+  // 8: cooldown.
   const cooldown = Number(k.cooldown_seconds ?? 0);
   if (cooldown > 0 && s.last_run_at != null && (now - ms(s.last_run_at)) < cooldown * 1000) {
-    return out('skip', 'cooldown', { wouldSuppress });
+    return out('skip', 'cooldown');
   }
 
-  // spec 7.9: daily cap, 0 means none.
+  // 9: daily cap, 0 means none.
   const cap = Number(k.daily_cap ?? 0);
-  if (cap > 0 && Number(s.runs_today ?? 0) >= cap) return out('skip', 'cap', { wouldSuppress });
+  if (cap > 0 && Number(s.runs_today ?? 0) >= cap) return out('skip', 'cap');
 
-  // spec 7.10: v1 knows no blackout conditions. Any entry is warned about and ignored.
+  // 10: v1 knows no blackout conditions. Any entry is warned about and ignored.
   const blackout = list(k.blackout);
   if (blackout.length) warnings.push(`blackout entries ignored in v1: ${blackout.join(',')}`);
 
-  // spec 7.11: a Rachio program already watering a target valve wins. runDecision only looks this
-  // up after every earlier check has passed (review item 9), so skip paths make no Rachio calls.
+  // 11: a Rachio program already watering a target valve wins. runDecision only looks this up after
+  // every earlier check has passed, so skip paths make no Rachio calls.
   if (k.skip_when_program_running !== false && s.program_running === true) {
-    return out('skip', 'program_running', { wouldSuppress });
+    return out('skip', 'program_running');
   }
 
-  // spec 7.12 and 7.13: fire. dry_run rides as a flag, the reason stays target.
-  return out('fire', timeoutFire ? 'no_verdict_timeout' : 'target', { wouldSuppress });
+  // 12 and 13: fire. dry_run rides as a flag, the reason stays target.
+  return out('fire', 'target');
 }
 
 /**
- * resolveValves: pure valve-map reader for the input_text.auto_ttds_valve_map knob (spec 4).
+ * resolveValves: pure valve-map reader for the input_text.auto_ttds_valve_map knob.
  * "*" means every known valve; otherwise "cameraId:valveId|valveId;cameraId:valveId".
  */
 export function resolveValves(cameraId, valveMap, allValveIds) {

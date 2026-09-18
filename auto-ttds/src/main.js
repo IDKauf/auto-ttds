@@ -25,23 +25,14 @@ export function backoffMs(consecutiveFailures) {
 
 const listKnob = (v) => String(v ?? '').split(',').map((s) => s.trim()).filter(Boolean);
 
-/**
- * The only two skip reasons a later Ring label may overturn. Ring's push payload carries a
- * detection_type enum with no animal value, so a push-sourced insert decides on human,
- * loitering, motion, other_motion or null, and the events API brings the real label minutes
- * later. Every other reason (person, disabled, not_greenlisted, friendly, cooldown, cap,
- * program_running, dry_run) stands whatever the label turns out to be.
- */
-export const REDECIDE_REASONS = new Set(['non_target', 'stale']);
+/** Ring says human. That is the one label that decides anything, and it costs no classifier call. */
+const isHumanLabel = (label) => String(label ?? '').trim().toLowerCase() === 'human';
 
-/** The Ring label this decision was made on. Older rows predate the field, so the row is the fallback. */
-function decidedLabel(decision, fallback) {
-  try {
-    const knobs = JSON.parse(decision?.knobs_json ?? '{}');
-    if (Object.prototype.hasOwnProperty.call(knobs, 'decided_label')) return knobs.decided_label;
-  } catch { /* unreadable knobs_json, fall back to the row */ }
-  return fallback;
-}
+/**
+ * The verdict decide() is handed when Ring itself called the event a person. It is not written to
+ * the verdicts table: nothing was classified, and nothing should look as though it was.
+ */
+const RING_PERSON_VERDICT = { species: 'person', is_person: true, source: 'ring' };
 
 class App {
   constructor(opts) {
@@ -74,7 +65,7 @@ class App {
     }
 
     const row = eventRow(camera, e, 'poll', nowIso());
-    row.test = this.knobs().test_mode ? 1 : 0; // spec 7.2
+    row.test = this.knobs().test_mode ? 1 : 0;
     this.db.insertEvent(row);
     log.info(`event ${id} ${camera.name} kind=${row.kind} label=${row.ring_label ?? 'none'}`);
     await this.ha.fireEvent('auto_ttds_event', row);
@@ -84,28 +75,53 @@ class App {
 
     // Review item 1: the first poll after a boot returns the whole backlog. Record it, never fire.
     if (isStale(row, { now: Date.now(), processStartedAt: this.startedAt, staleAfterS: this.opts.stale_after_s })) {
-      const decision = {
-        event_id: id, at: nowIso(), action: 'skip', reason: 'stale', mode: this.knobs().mode,
-        knobs_json: JSON.stringify({
-          started_at: this.startedAt, ring_created_at: row.ring_created_at,
-          stale_after_s: this.opts.stale_after_s, decided_label: row.ring_label ?? null,
-        }),
-      };
-      this.db.upsertDecision(decision);
-      await this.ha.fireEvent('auto_ttds_decision', decision);
-      log.debug(`decision ${id} skip/stale`);
+      await this.recordSkip(id, 'stale', {
+        started_at: this.startedAt, ring_created_at: row.ring_created_at, stale_after_s: this.opts.stale_after_s,
+      });
       return;
     }
 
-    await this.runDecision(id);
+    await this.triage(row);
   }
 
   /**
-   * enrich: the poll pass carries what a push cannot. Review item 3 kept the push row's provenance
-   * and first_seen_at; v0.2 also re-decides when the label the decision was made on is not the label
-   * the row now holds, because a push-sourced insert can only ever have seen a non-animal label
-   * (see REDECIDE_REASONS). The check is against decisions.decided_label rather than against this
-   * pass's own diff, so a row stranded by an earlier version heals on the next poll that sees it.
+   * triage: what happens to a brand new event, v0.3.
+   * Nothing here decides to fire. Only a classification can do that.
+   * 1. A camera off the greenlist is decided now and never classified: that is the cost control.
+   * 2. Ring calling it human is decided now as skip/person, and costs no classifier call either.
+   * 3. Everything else gets an image as fast as it can and is decided when the verdict lands.
+   */
+  async triage(row) {
+    const id = String(row.event_id);
+    if (!this.greenCameras().includes(String(row.camera_id))) {
+      await this.runDecision(id, null); // decide() stops at the greenlist before it reads a species
+      return;
+    }
+    if (isHumanLabel(row.ring_label)) {
+      await this.runDecision(id, RING_PERSON_VERDICT);
+      return;
+    }
+    // No decision yet. The snapshot path (push) or the clip path (media loop) feeds the classifier,
+    // and classifyEvent decides as soon as it has an answer.
+    await this.classifyEvent(id);
+  }
+
+  /** A decision no knob can change: the event is too old, or nothing could be classified. */
+  async recordSkip(eventId, reason, detail = {}) {
+    const decision = {
+      event_id: eventId, at: nowIso(), action: 'skip', reason, mode: this.knobs().mode,
+      knobs_json: JSON.stringify(detail),
+    };
+    this.db.upsertDecision(decision);
+    await this.ha.fireEvent('auto_ttds_decision', decision);
+    log.info(`decision ${eventId} skip/${reason}`);
+  }
+
+  /**
+   * enrich: the poll pass carries what a push cannot, so the row gains the fields a push never had.
+   * Review item 3 keeps the push row's provenance and first_seen_at. Enrichment decides nothing: in
+   * v0.3 only a classification does that. A label that turns out to be human still stops a run that
+   * is already going, and the poll data is what lets the media loop fetch the clip.
    */
   async enrich(existing, camera, e) {
     const id = String(existing.event_id);
@@ -127,32 +143,14 @@ class App {
 
     const before = existing.ring_label ?? null;
     const after = next.ring_label ?? null;
-    if (String(before ?? '') !== String(after ?? '') && String(after ?? '').toLowerCase() === 'human') {
+    if (String(before ?? '') !== String(after ?? '') && isHumanLabel(after)) {
       await this.stopIfPerson({ camera_id: existing.camera_id, ring_label: 'human' });
+      // A label that turns human before anything was decided is still the free answer, and the
+      // event is now out of the classifier queue, so this is the one decision enrichment writes.
+      if (!this.db.getDecision(id) && !this.db.getVerdict(id)) {
+        await this.runDecision(id, RING_PERSON_VERDICT);
+      }
     }
-    return this.redecide(id, before, after);
-  }
-
-  /**
-   * redecide: the label that arrived late gets the decision it would have got at insert. Only a
-   * skip for non_target or stale is eligible, only when nothing has run for the event, and only
-   * while the event is still fresh enough to be worth water. Enrichment on its own still decides
-   * nothing: the comparison is against the label the decision itself was made on, which for a row
-   * written before decided_label existed falls back to the label the row already held.
-   */
-  async redecide(eventId, before, after) {
-    const decision = this.db.getDecision(eventId);
-    if (!decision || decision.action !== 'skip' || !REDECIDE_REASONS.has(decision.reason)) return false;
-    if (String(decidedLabel(decision, before) ?? '') === String(after ?? '')) return false;
-    if (this.db.runsForEvent(eventId).length) return false; // an event still runs at most once
-    const event = this.db.getEvent(eventId);
-    if (isStale(event, { now: Date.now(), processStartedAt: this.startedAt, staleAfterS: this.opts.stale_after_s })) {
-      log.info(`event ${eventId} is now labeled ${after ?? 'none'} but is too old to act on; the skip stands`);
-      return false;
-    }
-    log.info(`event ${eventId} relabeled ${before ?? 'none'} to ${after ?? 'none'}; deciding again after skip/${decision.reason}`);
-    await this.runDecision(eventId, { redecidedFrom: decision.reason });
-    return true;
   }
 
   async handlePush(camera, notification) {
@@ -174,34 +172,52 @@ class App {
       kind: ding.subtype ?? undefined,
       test: this.knobs().test_mode ? 1 : 0,
     });
-    if (String(ding.detection_type ?? '').toLowerCase() === 'human') {
+    const human = isHumanLabel(ding.detection_type);
+    if (human) {
+      // A person stops whatever is running, always. The decision is only written when nothing has
+      // decided this event yet, so a push never rewrites a decision the pipeline already made.
       await this.stopIfPerson({ camera_id: String(camera.id), ring_label: 'human' });
+      if (!this.db.getDecision(id)) await this.runDecision(id, RING_PERSON_VERDICT);
+      return;
     }
+    if (this.db.getDecision(id) || this.db.getVerdict(id)) return; // already handled
+
+    // The push snapshot is the fastest image there is: seconds, against minutes for the clip. It is
+    // what makes a classify-first pipeline quick enough to be worth water (spec 3a).
     const uuid = notification?.img?.snapshot_uuid;
-    if (uuid && this.greenCameras().includes(String(camera.id))) {
-      this.ring.saveSnapshot(camera, id, uuid)
-        .then((p) => { if (p) this.db.updateEvent(id, { snapshot_path: p }); })
-        .catch(() => {});
+    const row = this.db.getEvent(id);
+    if (uuid && !row?.snapshot_path && this.greenCameras().includes(String(camera.id))) {
+      try {
+        const p = await this.ring.saveSnapshot(camera, id, uuid);
+        if (p) this.db.updateEvent(id, { snapshot_path: p });
+      } catch (err) {
+        log.debug(`snapshot for ${id} failed: ${err.message}`);
+      }
     }
-    if (!known) this.runDecision(id).catch((err) => log.error(`push decision failed: ${err.message}`));
+    // A row the poll already inserted has been triaged once, so it only needs the classifier.
+    if (known) await this.classifyEvent(id);
+    else await this.triage(this.db.getEvent(id) ?? { event_id: id, camera_id: String(camera.id) });
   }
 
-  // ---- decision (spec 6.2, 6.5, 7) --------------------------------------
-  async runDecision(eventId, { redecidedFrom = null } = {}) {
+  // ---- decision ---------------------------------------------------------
+  /**
+   * runDecision(eventId, verdict): the only place a decision row is written by decide().
+   *
+   * v0.3: the caller brings the verdict, because the classification is what decides. There are
+   * three kinds of caller: a camera off the greenlist (verdict null, decide() stops at the
+   * greenlist before it reads a species), a Ring human label (RING_PERSON_VERDICT, from the poll or
+   * the push), and a finished classification.
+   */
+  async runDecision(eventId, verdict) {
     // Review item 12: 14 state reads, so the README claim that a knob change needs no restart and
     // takes effect on the next decision is literally true. The 30 s loop still feeds the page.
     await this.knobStore.refresh();
-    // The row is read after that await, never before: an enrichment landing while the knobs were
-    // being fetched would otherwise be overwritten by a decision made on the label it replaced, and
-    // the event would sit unfired with no later poll able to notice. No await stands between this
-    // read and upsertDecision on any skip path.
+    // The row is read after that await, never before, so a decision is always made on the row as it
+    // stands once the knobs are in hand rather than on a copy an enrichment has already replaced.
+    // No await stands between this read and upsertDecision on any skip path.
     const event = this.db.getEvent(eventId);
     if (!event) return;
     const knobs = this.knobs();
-    const verdictRow = this.db.getVerdict(eventId);
-    const verdict = verdictRow && !verdictRow.error
-      ? { ...verdictRow, is_person: verdictRow.is_person === 1, friendly: verdictRow.friendly === 1 }
-      : null;
     const valves = resolveValves(event.camera_id, knobs.valve_map, this.valves.map((v) => v.id));
     const state = { ...this.db.decisionState(), now: Date.now(), program_running: false };
 
@@ -223,12 +239,11 @@ class App {
       mode: result.mode,
       knobs_json: JSON.stringify({
         ...knobs,
-        would_suppress: result.wouldSuppress,
         dry_run: result.dryRun,
         test: result.test,
         valves,
-        decided_label: event.ring_label ?? null,
-        ...(redecidedFrom ? { redecided: true, previous_reason: redecidedFrom } : {}),
+        species: verdict?.species ?? null,
+        verdict_source: verdict?.source ?? (verdict ? 'classifier' : null),
       }),
     };
     this.db.upsertDecision(decision);
@@ -342,54 +357,53 @@ class App {
     }
   }
 
-  // ---- classify (spec 6.4) ----------------------------------------------
+  // ---- classify, then decide (spec 6.4, v0.3 flow) ----------------------
+  /**
+   * The images for one event, fastest first: the push snapshot arrives within seconds, the clip
+   * frames take minutes. Either is enough to classify (spec 3a to 3c).
+   */
+  imagesFor(event) {
+    if (event.snapshot_path && fs.existsSync(event.snapshot_path)) return [event.snapshot_path];
+    return framePaths(this.opts.data_dir, event.event_id).filter((p) => fs.existsSync(p));
+  }
+
   async classifyPass() {
-    const knobs = this.knobs();
-    const friendlies = listKnob(knobs.friendlies);
     // Review item 4: eligibility is filtered in SQL, so ineligible rows cannot fill the window.
     for (const event of this.db.eventsAwaitingVerdict(this.greenCameras(), 5)) {
-      if (this.classifying.has(event.event_id)) continue;
-      this.classifying.add(event.event_id);
-      try {
-        const frames = framePaths(this.opts.data_dir, event.event_id).filter((p) => fs.existsSync(p));
-        const snapshot = event.snapshot_path && fs.existsSync(event.snapshot_path) ? [event.snapshot_path] : [];
-        const images = frames.length ? frames : snapshot;
-        if (!images.length) continue;
-        const verdict = await this.classifier.classify(images, friendlies);
-        this.db.upsertVerdict({ ...verdict, event_id: event.event_id });
-        if (!verdict.error) {
-          this.db.addCost(localDayKey(), verdict.input_tokens, verdict.output_tokens, verdict.usd);
-          log.info(`verdict ${event.event_id} ${verdict.species} conf=${verdict.confidence} usd=${verdict.usd.toFixed(5)}`);
-          if (verdict.is_person === 1) await this.stopActiveRuns('person', { cameraId: event.camera_id });
-        } else {
-          log.warning(`verdict ${event.event_id} failed: ${verdict.error}`);
-        }
-        await this.afterVerdict(event, verdict, friendlies);
-      } finally {
-        this.classifying.delete(event.event_id);
-      }
+      await this.classifyEvent(event.event_id);
     }
   }
 
   /**
-   * afterVerdict: classifier_wait re-decides (spec 6.5). Immediate mode does not: the run already
-   * happened, so a friendly species is recorded on the decision instead (review item 6).
+   * classifyEvent: classify what images exist, then decide from the result and nothing else.
+   * An event with no image yet is left alone; the media loop will bring frames and this runs again.
+   * A classifier failure that outlived its one retry is a skip, never a run: the system does not
+   * water the yard on a guess.
    */
-  async afterVerdict(event, verdict, friendlies) {
-    const decision = this.db.getDecision(event.event_id);
-    if (!decision) return;
-    if (decision.action === 'defer') { await this.runDecision(event.event_id); return; }
-    if (decision.mode !== 'immediate' || verdict.error) return;
-    const species = String(verdict.species ?? '').toLowerCase();
-    const friendly = verdict.friendly === 1 || (species !== '' && friendlies.map((f) => f.toLowerCase()).includes(species));
-    if (!friendly) return;
-    this.db.patchDecisionKnobs(event.event_id, { would_suppress: 1, friendly_species: species || null });
-    log.info(`verdict ${event.event_id} is a friendly (${species}); decision recorded as would_suppress`);
-  }
+  async classifyEvent(eventId) {
+    if (this.classifying.has(eventId)) return;
+    const event = this.db.getEvent(eventId);
+    if (!event) return;
+    if (this.db.getVerdict(eventId) || this.db.getDecision(eventId)) return;
+    const images = this.imagesFor(event);
+    if (!images.length) return;
 
-  /** Deferred events whose classifier wait expired (spec 6.5). */
-  async deferPass() {
-    for (const event of this.db.deferredEvents()) await this.runDecision(event.event_id);
+    this.classifying.add(eventId);
+    try {
+      const verdict = await this.classifier.classify(images, listKnob(this.knobs().friendlies));
+      this.db.upsertVerdict({ ...verdict, event_id: eventId });
+      if (verdict.error) {
+        log.warning(`verdict ${eventId} failed: ${verdict.error}`);
+        await this.recordSkip(eventId, 'classifier_error', { error: verdict.error, images: images.length });
+        return;
+      }
+      this.db.addCost(localDayKey(), verdict.input_tokens, verdict.output_tokens, verdict.usd);
+      log.info(`verdict ${eventId} ${verdict.species} conf=${verdict.confidence} usd=${verdict.usd.toFixed(5)}`);
+      if (verdict.is_person === 1) await this.stopActiveRuns('person', { cameraId: event.camera_id });
+      await this.runDecision(eventId, { ...verdict, is_person: verdict.is_person === 1, source: 'classifier' });
+    } finally {
+      this.classifying.delete(eventId);
+    }
   }
 
   // ---- poll with backoff (spec 6.8, review item 15) ---------------------
@@ -481,7 +495,6 @@ class App {
       loop(() => this.pollDelayMs, () => this.pollPass(), 'poll'),
       loop(10000, () => this.mediaPass(), 'media'),
       loop(10000, () => this.classifyPass(), 'classify'),
-      loop(10000, () => this.deferPass(), 'defer'),
       loop(30000, () => this.knobStore.refresh(), 'knobs'),
       loop(60000, () => this.publishHealth(), 'health'),
       loop(30000, async () => fs.writeFileSync(path.join(this.opts.data_dir, 'heartbeat'), nowIso()), 'heartbeat'),

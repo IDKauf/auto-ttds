@@ -5,17 +5,40 @@ Smart Hose Timer, classifies what the camera saw with Claude, and serves a revie
 
 ## What it does
 
+The classification decides whether water runs. Nothing else does.
+
 1. Polls the Ring events API for every camera, and listens for pushes when Ring sends any. Cameras
    that are not on the greenlist appear in the events table and nothing more: no clip download, no
    frames, no classifier call.
-2. Decides whether to run, using the knobs below. In `immediate` mode the run starts the moment the
-   event lands; in `classifier_wait` mode it waits for the species verdict first.
-3. Downloads the clip when Ring makes one available, extracts three frames with ffmpeg at 1, 3 and 6
-   seconds, and sends them to Claude for a species verdict.
-4. Starts the mapped Rachio valves, then polls until the cloud confirms the run and until it clears.
-5. Stores events, verdicts, decisions, runs, labels, pushes and daily costs in SQLite.
-6. Serves a review page with two labels per event: what the animal actually was, and whether the
+2. If Ring itself says the event is a person, the answer is skip, reason `person`, decided on the
+   spot for nothing. That event is never classified, and it stops any run already going on that
+   camera.
+3. Otherwise it gets an image as fast as it can: the push snapshot first, because it arrives within
+   seconds, and the clip frames at 1, 3 and 6 seconds when there is no snapshot.
+4. Claude classifies whatever images exist and returns one species from a fixed list.
+5. The decision is made from that species, using the knobs below, and only then do the mapped Rachio
+   valves start. Until a classification exists an event has no decision and no run. A classifier
+   failure that outlives its one retry is recorded as skip, reason `classifier_error`: the system
+   never waters the yard on a guess.
+6. Stores events, verdicts, decisions, runs, labels, pushes and daily costs in SQLite.
+7. Serves a review page with two labels per event: what the animal actually was, and whether the
    system should have fired. Those labels build the training set for the friendlies list.
+
+### What the classifier may answer
+
+`person`, `none` (no animal present, for example moving shade or an empty yard), `animal_unknown`
+(an animal is there but the species is unclear), `eyes_unknown` (only eyeshine is visible, typical
+of night infrared, so an animal is presumed present), or one of `cat`, `dog`, `raccoon`, `opossum`,
+`skunk`, `rabbit`, `rat`, `bird`, `deer`, `coyote`, `squirrel`. It also returns a free-text `detail`
+field that nothing acts on, plus a count, a confidence and a line of evidence.
+
+### Decision reasons
+
+`target` is the only one that runs water. The skips are `disabled`, `not_greenlisted`, `person`,
+`no_animal`, `friendly`, `non_target`, `cooldown`, `cap`, `program_running`, `stale` and
+`classifier_error`. `blackout`, `dry_run`, `test` and `no_verdict_timeout` are schema slots that are
+never written: a blackout entry is warned about and ignored, a dry run keeps the reason `target`,
+test rides as a flag, and the classifier wait it belonged to no longer exists.
 
 ## Install
 
@@ -48,9 +71,10 @@ page.
 
 ## Knobs
 
-These are Home Assistant helper entities. The add-on re-reads all fourteen helper states on every
-decision, fourteen GETs against the Supervisor API, so a knob change needs no restart and takes
-effect on the next event. A helper that does not exist falls back to its default. The staleness
+These are Home Assistant helper entities, fourteen of them, unchanged since v0.1. The add-on
+re-reads all fourteen helper states on every decision, fourteen GETs against the Supervisor API, so
+a knob change needs no restart and takes effect on the next event. Two of them changed meaning in
+v0.3, `target_labels` and `mode`; none was added or removed. A helper that does not exist falls back to its default. The staleness
 cutoff is not a helper: it is the `stale_after_s` add-on option above, because changing it should be
 a deliberate act rather than a slider.
 
@@ -59,35 +83,34 @@ a deliberate act rather than a slider.
 | `input_boolean.auto_ttds_enabled` | boolean | on | master switch; off means log only |
 | `input_boolean.auto_ttds_dry_run` | boolean | off | on means decide and log, never call Rachio |
 | `input_boolean.auto_ttds_test_mode` | boolean | off | on means every new event is tagged test |
-| `input_select.auto_ttds_mode` | select: immediate, classifier_wait | immediate | when to fire relative to the verdict |
+| `input_select.auto_ttds_mode` | select: immediate, classifier_wait | immediate | recorded on every decision and nothing more; since v0.3 the classification always comes first, so there is nothing left to wait for |
 | `input_text.auto_ttds_camera_greenlist` | text | 639481050,73991832 | camera ids that may trigger; an empty list means nothing triggers |
-| `input_text.auto_ttds_target_labels` | text | animal | Ring labels that count as a target |
-| `input_text.auto_ttds_friendlies` | text | rabbit | species that suppress a run in classifier_wait, and are recorded as would-suppress in immediate |
+| `input_text.auto_ttds_target_labels` | text | * | classifier species that fire, or `*` for any animal. `animal_unknown` and `eyes_unknown` are animals |
+| `input_text.auto_ttds_friendlies` | text | rabbit | classifier species that suppress the run outright |
 | `input_text.auto_ttds_valve_map` | text | * | `*` means all valves, else `cameraId:valveId\|valveId;cameraId:...` |
 | `input_number.auto_ttds_run_seconds` | number 5 to 600 | 60 | run duration |
 | `input_number.auto_ttds_cooldown_seconds` | number 0 to 3600 | 0 | minimum gap between runs |
 | `input_number.auto_ttds_daily_cap` | number 0 to 500 | 0 | 0 means no cap |
 | `input_text.auto_ttds_blackout` | text | empty | reserved; v1 knows no conditions, so any entry is logged and ignored |
 | `input_boolean.auto_ttds_skip_when_program_running` | boolean | on | skip when a Rachio program is watering a target valve |
-| `input_number.auto_ttds_classifier_max_wait_s` | number 0 to 300 | 120 | classifier_wait only: fire without a verdict after this |
+| `input_number.auto_ttds_classifier_max_wait_s` | number 0 to 300 | 120 | recorded and nothing more; since v0.3 there is no firing without a verdict to wait out |
 
 ## What the add-on will not do
 
 1. It does not fire on a backlog. An event created before the add-on started, or older than
    `stale_after_s` (default 300 seconds), is recorded with the decision reason `stale` and never runs
    a valve. This is what stops a restart from spraying for every event of the last two days.
-2. It does not run the same event twice. It decides again for an event only in one case: the poll
-   pass brings a Ring label that differs from the one the decision was made on, the decision was a
-   skip for `non_target` or `stale`, and nothing has run for that event. Ring's push payload has no
-   `animal` value, so this is what stops a push-first cat event from being skipped for good.
-3. A `human` push that arrives after a poll-triggered fire still stops the run. It does not overwrite
-   the stored `animal` label, so only the recorded label loses the human signal, never the behavior.
-4. It does not classify or download clips for cameras off the greenlist, and it does not classify an
-   event with no Ring label.
-5. An event is only sent to the classifier when it is on a greenlisted camera AND carries a non-null
-   Ring label. That pair is deliberate: it is the cost control on the Claude spend.
-6. An Anthropic outage that outlasts the single retry leaves those events unclassified in v1. There
-   is no later sweep, and the verdict row holds the error.
+2. It does not decide twice. An event is classified once and run once. A poll pass that enriches a
+   row a push created brings no new decision with it: the classification already made the call, or
+   is still to come.
+3. It does not act on the Ring label, with one exception: `human`, which skips the event and stops
+   any run already going on that camera. Ring's `animal` and `other_motion` labels change nothing.
+4. A `human` push that arrives after a fire still stops the run. It does not overwrite the stored
+   label, so only the recorded label loses the human signal, never the behavior.
+5. It does not classify or download clips for cameras off the greenlist, and it does not classify an
+   event Ring has already called human. That is the cost control on the Claude spend.
+6. An Anthropic outage that outlasts the single retry leaves those events unclassified. There is no
+   later sweep, the verdict row holds the error, and the decision is skip `classifier_error`.
 
 ## Reliability
 
@@ -109,12 +132,14 @@ a deliberate act rather than a slider.
 
 The page is served over ingress from the add-on sidebar panel.
 
-1. Tiles: events today and over 7 days, runs today and over 7 days, spend this month, push status,
-   median clip delay, and false-spray and miss rates split into day and night. Each rate tile shows
-   its denominator, for example "2 of 9"; an event with no Yes or No answer counts in neither.
+1. Tiles: events today and over 7 days, events fired today, runs today and over 7 days, valve
+   seconds today and over 7 days, flow, spend this month, push status, median clip delay, and
+   false-spray and miss rates split into day and night. Each rate tile shows its denominator, for
+   example "2 of 9"; an event with no Yes or No answer counts in neither.
 2. Table, newest first, with filters for camera, Ring label, action, test events and unlabeled only.
    Each row shows the local time, camera, Ring label, species with confidence, action with reason,
-   whether the run was confirmed, clip delay, three frame thumbnails and a clip button.
+   the run (seconds requested, confirmed yes or no, and flow when it is known), clip delay, three
+   frame thumbnails and a clip button.
 3. Label controls on each row, two independent judgements plus a note:
    a "was" box prefilled with the classifier species, and a Yes or No answer to "should have fired".
    Either can be set on its own. Labels export at `api/export/labels.csv`.
@@ -124,6 +149,22 @@ The page is served over ingress from the add-on sidebar panel.
    ingress can use it.
 6. The page refreshes every 30 seconds. The tiles and charts always update. The table holds still
    while you have a label field focused or an unsaved edit, so nothing you typed is thrown away.
+
+## Water, honestly
+
+The Smart Hose Timer has an integrated flow meter, but all three valves report `detectFlow: false`
+today and the valve state carries no flow or volume field at all. So the add-on can record that a
+valve was commanded open and that the cloud acknowledged it, and nothing more.
+
+1. Every figure on the page labelled valve seconds is valve open time, not measured water. A run
+   that was confirmed and then cleared is timed from the clock; one that was never confirmed cleared
+   is counted at the seconds it asked for.
+2. `runs.flow_detected` is 1, 0 or NULL, and it is NULL on every row today. The flow tile reads
+   "not reported" for as long as that is true, which is not the same as reporting that no water
+   moved.
+3. The lookup that fills that column searches the valve payload for a flow reading rather than a
+   fixed field name, and ignores the `detectFlow` capability flag. The day Rachio starts sending a
+   reading, the column fills itself in with no code change.
 
 ## Home Assistant entities the add-on writes
 

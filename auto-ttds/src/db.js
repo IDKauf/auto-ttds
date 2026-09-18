@@ -14,15 +14,19 @@ CREATE TABLE IF NOT EXISTS verdicts (
   event_id TEXT PRIMARY KEY, model TEXT, species TEXT, count INTEGER, is_person INTEGER, friendly INTEGER,
   confidence REAL, frames_agree INTEGER, raw_json TEXT, input_tokens INTEGER, output_tokens INTEGER,
   usd REAL, latency_ms INTEGER, at TEXT, error TEXT);
--- decisions.reason: target | non_target | not_greenlisted | person | friendly | cooldown | cap |
---   blackout | program_running | disabled | dry_run | test | no_verdict_timeout | stale
+-- decisions.reason: target | non_target | not_greenlisted | person | no_animal | friendly | cooldown |
+--   cap | blackout | program_running | disabled | dry_run | test | no_verdict_timeout | stale |
+--   classifier_error
 CREATE TABLE IF NOT EXISTS decisions (
   event_id TEXT PRIMARY KEY, at TEXT, action TEXT, reason TEXT, mode TEXT, knobs_json TEXT);
+-- runs.flow_detected (v0.3): 1 water moved, 0 it did not, NULL the timer reported no flow field.
+-- Every valve on this base station reports detectFlow false today, so this column is NULL in
+-- practice. It fills itself in if flow detection is ever switched on (rachio.js flowDetectedFrom).
 CREATE TABLE IF NOT EXISTS runs (
   run_id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT, valve_id TEXT, valve_name TEXT,
   -- runs.stopped_by: duration | person | manual | shutdown | null
   requested_s INTEGER, called_at TEXT, http_ms INTEGER, http_status INTEGER, confirmed_at TEXT,
-  cleared_at TEXT, stopped_by TEXT, error TEXT, dry_run INTEGER);
+  cleared_at TEXT, stopped_by TEXT, error TEXT, dry_run INTEGER, flow_detected INTEGER);
 -- labels.correct and labels.friendly are the v0.1 columns. v0.2 replaced them with two independent
 -- labels: actual (what the animal was) and should_have_fired (1 yes, 0 no, NULL unset). The old
 -- columns stay so rows written by v0.1 survive.
@@ -50,7 +54,7 @@ const VERDICT_COLS = ['event_id', 'model', 'species', 'count', 'is_person', 'fri
 const LABEL_COLS = ['event_id', 'by', 'correct', 'actual', 'friendly', 'note', 'at', 'should_have_fired'];
 
 const RUN_COLS = ['event_id', 'valve_id', 'valve_name', 'requested_s', 'called_at', 'http_ms',
-  'http_status', 'confirmed_at', 'cleared_at', 'stopped_by', 'error', 'dry_run'];
+  'http_status', 'confirmed_at', 'cleared_at', 'stopped_by', 'error', 'dry_run', 'flow_detected'];
 
 // node:sqlite binds only null, number, bigint, string and Buffer.
 const bind = (v) => {
@@ -120,8 +124,12 @@ export class Db {
 
   /** Columns added after v0.1. Idempotent: a PRAGMA check first, so an upgrade needs no dump. */
   migrate() {
-    const added = this.addColumn('labels', 'should_have_fired', 'INTEGER');
-    return { should_have_fired_backfilled: added ? this.backfillShouldHaveFired() : 0 };
+    const added = this.addColumn('labels', 'should_have_fired', 'INTEGER'); // v0.2
+    const flow = this.addColumn('runs', 'flow_detected', 'INTEGER'); // v0.3
+    return {
+      should_have_fired_backfilled: added ? this.backfillShouldHaveFired() : 0,
+      flow_detected_added: flow,
+    };
   }
 
   /**
@@ -209,21 +217,25 @@ export class Db {
   }
 
   /**
-   * Events with media and no verdict yet (spec 6.4), filtered in SQL so that ineligible rows can
-   * never starve the LIMIT window (review item 4). Ineligible means: camera off the greenlist,
-   * or no Ring label. An existing verdict row excludes the event whether or not it holds an error,
-   * because classify() already made its one in-call retry before writing that row.
+   * Events with media and no verdict yet, filtered in SQL so that ineligible rows can never starve
+   * the LIMIT window (review item 4). v0.3 drops the "must carry a Ring label" gate, because the
+   * classification is now what decides: an event with no label is exactly the one that needs it.
+   * Ineligible means: camera off the greenlist, Ring already called it human (decided for free), or
+   * a decision already exists (stale, not_greenlisted, person). An existing verdict row excludes the
+   * event whether or not it holds an error, because classify() already made its one in-call retry.
    */
   eventsAwaitingVerdict(greenCameraIds = [], limit = 10) {
     const green = (greenCameraIds ?? []).map(String).filter(Boolean);
     if (!green.length) return [];
     const marks = green.map(() => '?').join(', ');
     return this.all(
-      `SELECT e.* FROM events e LEFT JOIN verdicts v ON v.event_id = e.event_id
-       WHERE v.event_id IS NULL
+      `SELECT e.* FROM events e
+       LEFT JOIN verdicts v ON v.event_id = e.event_id
+       LEFT JOIN decisions d ON d.event_id = e.event_id
+       WHERE v.event_id IS NULL AND d.event_id IS NULL
          AND (e.frames_json IS NOT NULL OR e.snapshot_path IS NOT NULL)
          AND e.camera_id IN (${marks})
-         AND e.ring_label IS NOT NULL
+         AND LOWER(IFNULL(e.ring_label, '')) != 'human'
        ORDER BY e.first_seen_at ASC LIMIT ?`, ...green, limit,
     );
   }
@@ -249,24 +261,6 @@ export class Db {
   }
 
   getDecision(eventId) { return this.get('SELECT * FROM decisions WHERE event_id = ?', eventId) ?? null; }
-
-  /**
-   * Merge keys into decisions.knobs_json in place (review item 6). Used when a verdict lands after
-   * an immediate-mode decision: the record gains would_suppress, the decision itself does not change.
-   */
-  patchDecisionKnobs(eventId, patch) {
-    const row = this.getDecision(eventId);
-    if (!row) return false;
-    let knobs = {};
-    try { knobs = JSON.parse(row.knobs_json ?? '{}'); } catch { knobs = {}; }
-    this.run('UPDATE decisions SET knobs_json = ? WHERE event_id = ?', JSON.stringify({ ...knobs, ...patch }), eventId);
-    return true;
-  }
-
-  /** Events still waiting on a classifier verdict in classifier_wait mode (spec 6.5). */
-  deferredEvents() {
-    return this.all("SELECT * FROM events WHERE event_id IN (SELECT event_id FROM decisions WHERE action = 'defer')");
-  }
 
   // ---- runs -------------------------------------------------------------
   insertRun(row) {
@@ -351,6 +345,53 @@ export class Db {
     return this.countSince(table, column, localDayStartIso(now));
   }
 
+  // ---- water (v0.3) -----------------------------------------------------
+  /**
+   * valveSecondsSince: how long the valves were commanded open. This is valve open time, not
+   * measured water: the hose timer reports no volume at all (see flowSummary). A run that was
+   * confirmed and then cleared is counted from the clock, because a run stopped early by a person
+   * ran for less than it asked for. Dry runs move no water and are excluded.
+   * -> {seconds, runs, measured} where measured is how many of those runs were timed rather than
+   * taken from requested_s.
+   */
+  valveSecondsSince(iso) {
+    const rows = this.all(
+      'SELECT requested_s, confirmed_at, cleared_at FROM runs WHERE called_at >= ? AND dry_run = 0', iso,
+    );
+    let seconds = 0;
+    let measured = 0;
+    for (const r of rows) {
+      const span = (Date.parse(r.cleared_at) - Date.parse(r.confirmed_at)) / 1000;
+      if (Number.isFinite(span) && span >= 0) { seconds += span; measured += 1; } else seconds += Number(r.requested_s) || 0;
+    }
+    return { seconds: Math.round(seconds), runs: rows.length, measured };
+  }
+
+  /** Events that actually started water on the local day: one count per event, not per valve. */
+  eventsFiredSince(iso) {
+    return this.get(
+      `SELECT COUNT(DISTINCT r.event_id) AS n FROM runs r WHERE r.called_at >= ? AND r.dry_run = 0`, iso,
+    ).n;
+  }
+
+  /**
+   * flowSummary: what the flow meter has told us, over real runs.
+   * reported stays false while every flow_detected is NULL, which is the truth today: all three
+   * valves report detectFlow false and the valve state carries no flow field at all.
+   */
+  flowSummary(iso) {
+    const row = this.get(
+      `SELECT COUNT(*) AS runs,
+              SUM(CASE WHEN flow_detected = 1 THEN 1 ELSE 0 END) AS yes,
+              SUM(CASE WHEN flow_detected = 0 THEN 1 ELSE 0 END) AS no,
+              SUM(CASE WHEN flow_detected IS NULL THEN 1 ELSE 0 END) AS unknown
+       FROM runs WHERE called_at >= ? AND dry_run = 0`, iso,
+    );
+    const yes = Number(row?.yes ?? 0);
+    const no = Number(row?.no ?? 0);
+    return { runs: Number(row?.runs ?? 0), yes, no, unknown: Number(row?.unknown ?? 0), reported: yes + no > 0 };
+  }
+
   // ---- page queries -----------------------------------------------------
   listEvents(filters = {}) {
     const where = [];
@@ -372,7 +413,10 @@ export class Db {
               (SELECT COUNT(*) FROM runs r WHERE r.event_id = e.event_id AND r.confirmed_at IS NOT NULL) AS run_confirmed,
               (SELECT MIN(r.called_at) FROM runs r WHERE r.event_id = e.event_id) AS run_called_at,
               (SELECT MIN(r.confirmed_at) FROM runs r WHERE r.event_id = e.event_id) AS run_confirmed_at,
-              (SELECT MAX(r.dry_run) FROM runs r WHERE r.event_id = e.event_id) AS run_dry
+              (SELECT MAX(r.dry_run) FROM runs r WHERE r.event_id = e.event_id) AS run_dry,
+              (SELECT MAX(r.requested_s) FROM runs r WHERE r.event_id = e.event_id) AS run_requested_s,
+              -- MAX ignores NULLs, so this is NULL only when no valve reported flow at all
+              (SELECT MAX(r.flow_detected) FROM runs r WHERE r.event_id = e.event_id) AS run_flow
        FROM events e
        LEFT JOIN decisions d ON d.event_id = e.event_id
        LEFT JOIN verdicts v ON v.event_id = e.event_id

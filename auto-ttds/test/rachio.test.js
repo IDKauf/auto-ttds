@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { Rachio, readRachioKey, VALVE_BASE, PUBLIC_BASE } from '../src/rachio.js';
+import { Rachio, readRachioKey, flowDetectedFrom, VALVE_BASE, PUBLIC_BASE } from '../src/rachio.js';
 
 function mockFetch(handler) {
   const calls = [];
@@ -154,4 +154,66 @@ test('a stop that races startWatering is still sent once the start returns (revi
   assert.ok(order.indexOf('stopWatering') > order.indexOf('startWatering'));
   assert.equal(res.stoppedBy, 'person');
   assert.equal(callerStops, 0, 'the loop never delegates its stop away');
+});
+
+// ---- v0.3 flow tracking ----------------------------------------------------
+// Verified 2026-09-16: the timer has an integrated flow meter, all three valves report detectFlow
+// false, and the valve state carries no flow or volume field. So today the honest answer is null.
+
+test('the real valve payload reports no flow at all, which is null and not zero', () => {
+  const valve = {
+    id: 'v1', name: 'Hose Sprinkler 1', detectFlow: false,
+    state: { reportedState: { lastWateringAction: { start: '2026-09-16T03:00:00Z', durationSeconds: 60, reason: 'QUICK_RUN' } } },
+  };
+  assert.equal(flowDetectedFrom(valve), null);
+  assert.equal(flowDetectedFrom({ detectFlow: true, state: { reportedState: {} } }), null,
+    'the capability flag is not a reading, whichever way it is set');
+  assert.equal(flowDetectedFrom(null), null);
+  assert.equal(flowDetectedFrom({}), null);
+});
+
+test('the lookup starts working the day a flow field appears, with no code change', () => {
+  const withAction = (extra) => ({ state: { reportedState: { lastWateringAction: { reason: 'QUICK_RUN', ...extra } } } });
+  assert.equal(flowDetectedFrom(withAction({ flowDetected: true })), 1);
+  assert.equal(flowDetectedFrom(withAction({ flowDetected: false })), 0);
+  assert.equal(flowDetectedFrom(withAction({ flow_detected: 'true' })), 1);
+  assert.equal(flowDetectedFrom(withAction({ flowVolumeGallons: 2.5 })), 1);
+  assert.equal(flowDetectedFrom(withAction({ flowRate: 0 })), 0);
+  // A reading anywhere in the payload counts, not just on the watering action.
+  assert.equal(flowDetectedFrom({ state: { reportedState: { flowDetected: true, lastWateringAction: null } } }), 1);
+  // detectFlow next to a real reading never wins over it.
+  assert.equal(flowDetectedFrom({ detectFlow: false, state: { reportedState: { flowDetected: true } } }), 1);
+});
+
+test('startAndConfirm carries the flow reading onto the run row', async () => {
+  let tick = 0;
+  const { r } = rachio((url) => {
+    if (url.includes('startWatering')) return { json: { ok: true } };
+    tick += 1;
+    const action = tick <= 2 ? { reason: 'QUICK_RUN', durationSeconds: 60 } : null;
+    return { json: { valve: { detectFlow: true, state: { reportedState: { flowDetected: true, lastWateringAction: action } } } } };
+  }, { now: (() => { let t = 0; return () => (t += 1000); })() });
+
+  const patches = [];
+  const res = await r.startAndConfirm('v1', 60, {
+    onConfirmed: (p) => patches.push(p),
+    onCleared: (p) => patches.push(p),
+  });
+  assert.equal(res.flow, 1);
+  assert.equal(patches.at(-1).flow_detected, 1);
+});
+
+test('a run with no flow field reports flow as null, not as no water', async () => {
+  let tick = 0;
+  const { r } = rachio((url) => {
+    if (url.includes('startWatering')) return { json: { ok: true } };
+    tick += 1;
+    const action = tick <= 2 ? { reason: 'QUICK_RUN' } : null;
+    return { json: { valve: { detectFlow: false, state: { reportedState: { lastWateringAction: action } } } } };
+  }, { now: (() => { let t = 0; return () => (t += 1000); })() });
+
+  const cleared = [];
+  const res = await r.startAndConfirm('v1', 60, { onCleared: (p) => cleared.push(p) });
+  assert.equal(res.flow, null);
+  assert.equal(cleared[0].flow_detected, null);
 });

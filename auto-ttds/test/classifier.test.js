@@ -1,7 +1,7 @@
 // Cost math, prompt shape and the Claude call with a mocked client (spec 11.1, 10.2).
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { PRICES, usdFor, priceKeyFor, imageTokens, buildMessages, extractJson, framePaths, Classifier, VERDICT_SCHEMA, SYSTEM_PROMPT } from '../src/classifier.js';
+import { PRICES, usdFor, priceKeyFor, imageTokens, buildMessages, extractJson, framePaths, Classifier, VERDICT_SCHEMA, SYSTEM_PROMPT, SPECIES } from '../src/classifier.js';
 
 test('price table matches spec 1.6', () => {
   assert.deepEqual(PRICES['claude-haiku-4-5'], [1, 5]);
@@ -44,7 +44,7 @@ test('frame paths follow the naming rule', () => {
 });
 
 test('three image blocks then the text, in order (spec 6.4)', () => {
-  const msgs = buildMessages(['a', 'b', 'c'], ['rabbit']);
+  const msgs = buildMessages(['a', 'b', 'c']);
   assert.equal(msgs.length, 1);
   const c = msgs[0].content;
   assert.equal(c.length, 7);
@@ -55,16 +55,41 @@ test('three image blocks then the text, in order (spec 6.4)', () => {
   assert.equal(c[2].text, 'Image 2');
   assert.equal(c[4].text, 'Image 3');
   assert.equal(c[6].type, 'text');
-  assert.match(c[6].text, /Friendlies list: rabbit/);
+  assert.match(c[6].text, /Allowed species values: person, none, animal_unknown, eyes_unknown, cat/);
+  // The friendlies list is no longer sent: the knob suppresses in decide(), not the model.
+  assert.ok(!/[Ff]riendl/.test(c[6].text));
   // Never an assistant prefill (spec 10.4)
   assert.ok(msgs.every((m) => m.role === 'user'));
 });
 
-test('schema matches spec 6.4', () => {
-  assert.deepEqual(Object.keys(VERDICT_SCHEMA.properties).sort(), ['confidence', 'count', 'evidence', 'friendly', 'is_person', 'species']);
+test('a single snapshot is one image block', () => {
+  const c = buildMessages(['a'])[0].content;
+  assert.equal(c.length, 3);
+  assert.equal(c[0].text, 'Image 1');
+  assert.equal(c[1].type, 'image');
+});
+
+test('the species set is constrained, with a free-text detail field (v0.3)', () => {
+  assert.deepEqual(Object.keys(VERDICT_SCHEMA.properties).sort(), ['confidence', 'count', 'detail', 'evidence', 'species']);
+  assert.deepEqual(VERDICT_SCHEMA.properties.species.enum, SPECIES);
   assert.equal(VERDICT_SCHEMA.additionalProperties, false);
+  // is_person is derived from species, so the model is never asked for it.
+  assert.ok(!('is_person' in VERDICT_SCHEMA.properties));
+  assert.ok(!('friendly' in VERDICT_SCHEMA.properties));
+  assert.deepEqual(SPECIES.slice(0, 4), ['person', 'none', 'animal_unknown', 'eyes_unknown']);
+  for (const s of ['cat', 'dog', 'raccoon', 'opossum', 'skunk', 'rabbit', 'rat', 'bird', 'deer', 'coyote', 'squirrel']) {
+    assert.ok(SPECIES.includes(s), `${s} is an allowed species`);
+  }
+  assert.equal(SPECIES.length, 15);
+});
+
+test('the prompt says when to use each uncertain value', () => {
   assert.match(SYSTEM_PROMPT, /yard camera/);
   assert.match(SYSTEM_PROMPT, /Do not describe people/);
+  assert.match(SYSTEM_PROMPT, /"animal_unknown" when an animal is clearly present but you cannot tell which species/);
+  assert.match(SYSTEM_PROMPT, /"eyes_unknown" when all you can see is eyeshine/);
+  assert.match(SYSTEM_PROMPT, /"none" when no animal is present/);
+  assert.match(SYSTEM_PROMPT, /Eyeshine at night means an animal is there, so it is never "none"/);
 });
 
 test('extractJson reads parsed_output or a text block', () => {
@@ -82,7 +107,7 @@ function mockClient(impl) {
 test('classify returns a verdict row with usage and dollars', async () => {
   const client = mockClient(() => ({
     model: 'claude-haiku-4-5',
-    content: [{ type: 'text', text: JSON.stringify({ species: 'Coyote', count: 1, is_person: false, friendly: false, confidence: 0.82, evidence: 'four legs, bushy tail' }) }],
+    content: [{ type: 'text', text: JSON.stringify({ species: 'Coyote', detail: 'thin, moving left', count: 1, confidence: 0.82, evidence: 'four legs, bushy tail' }) }],
     usage: { input_tokens: 2200, output_tokens: 120 },
   }));
   let t = 0;
@@ -91,6 +116,7 @@ test('classify returns a verdict row with usage and dollars', async () => {
   assert.equal(v.species, 'coyote');
   assert.equal(v.is_person, 0);
   assert.equal(v.friendly, 0);
+  assert.equal(JSON.parse(v.raw_json).verdict.detail, 'thin, moving left');
   assert.equal(v.input_tokens, 2200);
   assert.equal(v.output_tokens, 120);
   assert.equal(Number(v.usd.toFixed(6)), 0.0028);
@@ -107,7 +133,7 @@ test('classify returns a verdict row with usage and dollars', async () => {
 test('a dated echoed model id still costs money (review item 5)', async () => {
   const client = mockClient(() => ({
     model: 'claude-haiku-4-5-20251001',
-    content: [{ type: 'text', text: '{"species":"cat","count":1,"is_person":false,"friendly":false,"confidence":0.9,"evidence":"x"}' }],
+    content: [{ type: 'text', text: '{"species":"cat","detail":"","count":1,"confidence":0.9,"evidence":"x"}' }],
     usage: { input_tokens: 2200, output_tokens: 120 },
   }));
   const c = new Classifier({ client, model: 'claude-haiku-4-5', readFile: () => Buffer.from('x') });
@@ -131,12 +157,37 @@ test('classify retries once after an API error, then reports it', async () => {
 test('a retry that succeeds returns the verdict', async () => {
   const client = mockClient((req, n) => {
     if (n === 1) throw new Error('529');
-    return { model: 'claude-haiku-4-5', content: [{ type: 'text', text: '{"species":"rabbit","count":1,"is_person":false,"friendly":true,"confidence":0.7,"evidence":"ears"}' }], usage: { input_tokens: 10, output_tokens: 5 } };
+    return { model: 'claude-haiku-4-5', content: [{ type: 'text', text: '{"species":"rabbit","detail":"","count":1,"confidence":0.7,"evidence":"ears"}' }], usage: { input_tokens: 10, output_tokens: 5 } };
   });
   const c = new Classifier({ client, readFile: () => Buffer.from('x'), sleep: async () => {} });
   const v = await c.classify(['/f/a_t1.jpg'], ['rabbit']);
   assert.equal(v.species, 'rabbit');
-  assert.equal(v.friendly, 1);
+  assert.equal(v.friendly, 1, 'friendly is derived from the knob list, not from the model');
+});
+
+test('is_person is derived from the species and nothing else', async () => {
+  const reply = (species) => mockClient(() => ({
+    model: 'claude-haiku-4-5',
+    content: [{ type: 'text', text: JSON.stringify({ species, detail: '', count: 1, confidence: 0.9, evidence: 'x' }) }],
+    usage: { input_tokens: 10, output_tokens: 5 },
+  }));
+  const person = await new Classifier({ client: reply('person'), readFile: () => Buffer.from('x') }).classify(['/f/a.jpg']);
+  assert.equal(person.is_person, 1);
+  assert.equal(person.species, 'person');
+  const eyes = await new Classifier({ client: reply('eyes_unknown'), readFile: () => Buffer.from('x') }).classify(['/f/a.jpg']);
+  assert.equal(eyes.is_person, 0);
+  assert.equal(eyes.species, 'eyes_unknown');
+});
+
+test('a species outside the allowed set is an error, never something to water on', async () => {
+  const client = mockClient(() => ({
+    model: 'claude-haiku-4-5',
+    content: [{ type: 'text', text: '{"species":"moving shadow","detail":"","count":0,"confidence":0.3,"evidence":"x"}' }],
+    usage: { input_tokens: 10, output_tokens: 5 },
+  }));
+  const v = await new Classifier({ client, readFile: () => Buffer.from('x') }).classify(['/f/a.jpg']);
+  assert.equal(v.species, null);
+  assert.match(v.error, /not in the allowed set/);
 });
 
 test('no readable frames means no API call', async () => {

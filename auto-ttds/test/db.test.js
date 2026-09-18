@@ -282,20 +282,20 @@ test('ineligible events cannot starve the verdict queue (review item 4)', () => 
     first_seen_at: iso(offsetMs), source: 'poll', kind: 'motion', ring_label: label,
     recording_status: 'ready', frames_json: '["f.jpg"]', test: 0, raw_json: '{}',
   });
-  // Six ineligible rows queued ahead of the one that matters, with a window of 5.
-  add('x1', '700809115', 'animal', -6000);
-  add('x2', '700809115', 'animal', -5000);
-  add('x3', '639481050', null, -4000);
-  add('x4', '639481050', null, -3000);
-  add('x5', '700809115', null, -2000);
-  add('x6', '639481050', null, -1000);
-  add('good', '639481050', 'animal', 0);
+  // Ineligible rows queued ahead of the one that matters, with a window of 3.
+  add('x1', '700809115', 'animal', -6000); // camera off the greenlist
+  add('x2', '700809115', null, -5000);
+  add('x3', '639481050', 'human', -4000); // Ring already called it a person: never classified
+  add('x4', '639481050', null, -3000); // decided already, below
+  add('good1', '639481050', null, -2000); // v0.3: no Ring label is no longer a reason to skip it
+  add('good2', '639481050', 'other_motion', -1000);
+  db.upsertDecision({ event_id: 'x4', at: iso(), action: 'skip', reason: 'stale', mode: 'immediate', knobs_json: '{}' });
 
-  const queue = db.eventsAwaitingVerdict(green, 5);
-  assert.deepEqual(queue.map((r) => r.event_id), ['good']);
+  assert.deepEqual(db.eventsAwaitingVerdict(green, 3).map((r) => r.event_id), ['good1', 'good2']);
 
   // An event with a verdict row drops out, error or not: classify() already made its one retry.
-  db.upsertVerdict({ event_id: 'good', model: 'm', at: iso(), error: 'overloaded' });
+  db.upsertVerdict({ event_id: 'good1', model: 'm', at: iso(), error: 'overloaded' });
+  db.upsertVerdict({ event_id: 'good2', model: 'm', at: iso(), species: 'cat' });
   assert.deepEqual(db.eventsAwaitingVerdict(green, 5), []);
   assert.deepEqual(db.eventsAwaitingVerdict([], 5), []);
   db.close();
@@ -305,15 +305,6 @@ test('a snapshot alone is enough to enter the verdict queue', () => {
   const db = new Db(':memory:');
   db.insertEvent({ event_id: 's1', camera_id: '639481050', ring_created_at: iso(), first_seen_at: iso(), source: 'push', ring_label: 'animal', snapshot_path: '/f/s1_snapshot.jpg', test: 0 });
   assert.equal(db.eventsAwaitingVerdict(['639481050'], 5).length, 1);
-  db.close();
-});
-
-test('deferred events come back for a second decision', () => {
-  const db = seed();
-  db.upsertDecision({ event_id: 'e1', at: iso(), action: 'defer', reason: 'target', mode: 'classifier_wait', knobs_json: '{}' });
-  assert.equal(db.deferredEvents().length, 1);
-  db.upsertDecision({ event_id: 'e1', at: iso(), action: 'fire', reason: 'target', mode: 'classifier_wait', knobs_json: '{}' });
-  assert.equal(db.deferredEvents().length, 0);
   db.close();
 });
 
@@ -365,24 +356,91 @@ test('one local-time helper set drives the cap, the tiles and the charts (review
   db.close();
 });
 
-test('patchDecisionKnobs merges without changing the decision (review item 6)', () => {
-  const db = seed();
-  db.upsertDecision({ event_id: 'e1', at: iso(), action: 'fire', reason: 'target', mode: 'immediate', knobs_json: JSON.stringify({ mode: 'immediate', would_suppress: 0 }) });
-  assert.equal(db.patchDecisionKnobs('e1', { would_suppress: 1, friendly_species: 'rabbit' }), true);
-  const row = db.getDecision('e1');
-  assert.equal(row.action, 'fire');
-  assert.equal(row.reason, 'target');
-  const knobs = JSON.parse(row.knobs_json);
-  assert.equal(knobs.would_suppress, 1);
-  assert.equal(knobs.friendly_species, 'rabbit');
-  assert.equal(knobs.mode, 'immediate');
-  assert.equal(db.patchDecisionKnobs('missing', { would_suppress: 1 }), false);
-  db.close();
-});
-
 test('median helper', () => {
   assert.equal(median([]), null);
   assert.equal(median([5]), 5);
   assert.equal(median([1, 3]), 2);
   assert.equal(median([9, 1, 5]), 5);
+});
+
+// ---- v0.3 water tracking ---------------------------------------------------
+
+test('an existing database gains flow_detected in place, and only once', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ttds-flow-'));
+  const file = path.join(dir, 'auto-ttds.db');
+  const old = new DatabaseSync(file);
+  old.exec(`CREATE TABLE runs (run_id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT, valve_id TEXT,
+    valve_name TEXT, requested_s INTEGER, called_at TEXT, http_ms INTEGER, http_status INTEGER,
+    confirmed_at TEXT, cleared_at TEXT, stopped_by TEXT, error TEXT, dry_run INTEGER)`);
+  old.prepare("INSERT INTO runs (event_id, valve_id, requested_s, called_at, dry_run) VALUES ('e1','v1',60,'2026-09-01T00:00:00.000Z',0)").run();
+  old.close();
+
+  const db = new Db(file);
+  assert.equal(db.migrations.flow_detected_added, true);
+  assert.equal(db.getRun(1).flow_detected, null, 'an existing run has no flow reading, not a false one');
+  db.updateRun(1, { flow_detected: 1 });
+  assert.equal(db.getRun(1).flow_detected, 1);
+  db.close();
+
+  const second = new Db(file);
+  assert.equal(second.migrations.flow_detected_added, false, 'the migration is idempotent');
+  assert.equal(second.getRun(1).flow_detected, 1);
+  second.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('valve seconds are timed when the run was timed and requested otherwise', () => {
+  const db = seed();
+  const day = localDayStartIso();
+  const at = iso(-60000);
+  // Confirmed and cleared: counted from the clock, because a run cut short ran for less.
+  db.insertRun({ event_id: 'e1', valve_id: 'v1', requested_s: 60, called_at: at, dry_run: 0,
+    confirmed_at: at, cleared_at: new Date(Date.parse(at) + 20000).toISOString() });
+  // Never cleared: the requested duration is the best figure there is.
+  db.insertRun({ event_id: 'e1', valve_id: 'v2', requested_s: 60, called_at: at, dry_run: 0 });
+  // A dry run moves no water at all.
+  db.insertRun({ event_id: 'e2', valve_id: 'v1', requested_s: 999, called_at: at, dry_run: 1 });
+
+  const today = db.valveSecondsSince(day);
+  assert.equal(today.seconds, 80);
+  assert.equal(today.runs, 2);
+  assert.equal(today.measured, 1);
+  assert.equal(db.eventsFiredSince(day), 1, 'two valves, one event');
+  assert.deepEqual(db.valveSecondsSince(iso(60000)), { seconds: 0, runs: 0, measured: 0 });
+  db.close();
+});
+
+test('flow reads as not reported until a valve actually reports it', () => {
+  const db = seed();
+  const day = localDayStartIso();
+  db.insertRun({ event_id: 'e1', valve_id: 'v1', requested_s: 60, called_at: iso(-1000), dry_run: 0 });
+  db.insertRun({ event_id: 'e1', valve_id: 'v2', requested_s: 60, called_at: iso(-1000), dry_run: 0 });
+  let f = db.flowSummary(day);
+  assert.equal(f.reported, false, 'no flow field means not reported, never "no water"');
+  assert.equal(f.unknown, 2);
+  assert.equal(f.runs, 2);
+
+  db.updateRun(1, { flow_detected: 1 });
+  db.updateRun(2, { flow_detected: 0 });
+  f = db.flowSummary(day);
+  assert.equal(f.reported, true);
+  assert.equal(f.yes, 1);
+  assert.equal(f.no, 1);
+  assert.equal(f.unknown, 0);
+  db.close();
+});
+
+test('a run row carries its requested seconds and flow to the page', () => {
+  const db = seed();
+  db.insertRun({ event_id: 'e1', valve_id: 'v1', valve_name: 'Hose Sprinkler 1', requested_s: 45, called_at: iso(), confirmed_at: iso(), dry_run: 0 });
+  db.insertRun({ event_id: 'e1', valve_id: 'v2', valve_name: 'Hose sprinkler 2', requested_s: 45, called_at: iso(), dry_run: 0 });
+  let row = db.listEvents({ camera: '639481050' })[0];
+  assert.equal(row.run_requested_s, 45);
+  assert.equal(row.run_confirmed, 1);
+  assert.equal(row.run_flow, null, 'null is the honest answer while nothing reports flow');
+
+  db.updateRun(2, { flow_detected: 1 });
+  row = db.listEvents({ camera: '639481050' })[0];
+  assert.equal(row.run_flow, 1);
+  db.close();
 });

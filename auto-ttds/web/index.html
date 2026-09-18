@@ -9,11 +9,11 @@
 :root {
   color-scheme: light dark;
   --bg: #f6f7f9; --card: #ffffff; --ink: #14161a; --muted: #5d6470; --line: #d9dde3;
-  --accent: #2f6df6; --fire: #1f9d55; --skip: #98a1ae; --warn: #b8541a;
+  --accent: #2f6df6; --fire: #1f9d55; --skip: #98a1ae;
 }
 @media (prefers-color-scheme: dark) {
   :root { --bg: #14161a; --card: #1d2026; --ink: #e8eaee; --muted: #9aa3b0; --line: #2c313a;
-          --accent: #6d9bff; --fire: #45c07d; --skip: #6c7482; --warn: #e08a4a; }
+          --accent: #6d9bff; --fire: #45c07d; --skip: #6c7482; }
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
@@ -40,7 +40,6 @@ td.mono, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; fo
 .pill { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; border: 1px solid var(--line); }
 .pill.fire { background: var(--fire); border-color: var(--fire); color: #fff; }
 .pill.skip { background: transparent; color: var(--muted); }
-.pill.defer { background: var(--warn); border-color: var(--warn); color: #fff; }
 .thumbs { display: flex; gap: 4px; }
 .thumbs img { width: 52px; height: 30px; object-fit: cover; border-radius: 4px; border: 1px solid var(--line); cursor: pointer; }
 .labelbox { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; max-width: 340px; }
@@ -76,6 +75,7 @@ dialog img, dialog video { max-width: 90vw; max-height: 78vh; display: block; }
 </header>
 <main>
   <div class="tiles" id="tiles"></div>
+  <p class="note" id="waternote">Water figures are valve open time: seconds the valve was commanded open and the cloud acknowledged. The hose timer reports no flow or volume today, so nothing here is measured water.</p>
 
   <div class="panel charts">
     <div class="chart"><h3>Runs per day, 30 days</h3><svg id="c-runs" viewBox="0 0 320 130" preserveAspectRatio="none"></svg></div>
@@ -87,7 +87,7 @@ dialog img, dialog video { max-width: 90vw; max-height: 78vh; display: block; }
     <div class="filters">
       <select id="f-camera"><option value="">All cameras</option></select>
       <select id="f-label"><option value="">All labels</option><option>animal</option><option>human</option><option>other_motion</option><option>none</option></select>
-      <select id="f-action"><option value="">All actions</option><option>fire</option><option>skip</option><option>defer</option></select>
+      <select id="f-action"><option value="">All actions</option><option>fire</option><option>skip</option></select>
       <select id="f-test"><option value="hide">Hide test events</option><option value="">Show test events</option><option value="only">Test events only</option></select>
       <label class="check"><input type="checkbox" id="f-unlabeled"> Unlabeled only</label>
       <input type="number" id="f-limit" value="200" min="1" max="1000" style="width:78px">
@@ -101,7 +101,7 @@ dialog img, dialog video { max-width: 90vw; max-height: 78vh; display: block; }
     <table>
       <thead><tr>
         <th>Time</th><th>Camera</th><th>Ring</th><th>Species</th><th>Action</th>
-        <th class="hide">Run</th><th class="hide">Clip delay</th><th>Frames</th><th>Label</th>
+        <th>Run</th><th class="hide">Clip delay</th><th>Frames</th><th>Label</th>
       </tr></thead>
       <tbody id="rows"></tbody>
     </table>
@@ -132,12 +132,23 @@ async function api(path, options) {
 }
 
 // ---- tiles (spec 8.1) -----------------------------------------------------
+// Water honesty (v0.3): the hose timer has a flow meter, but every valve reports detectFlow false
+// and the valve state carries no flow field, so these figures are valve open time and nothing more.
+function flowTile(f) {
+  if (!f || !f.reported) return ['Flow', 'not reported', 'the timer sends no flow reading yet'];
+  return ['Flow, 7 days', f.yes + ' of ' + (f.yes + f.no), 'runs where the meter saw water move'];
+}
+
 function renderTiles(m) {
   const r = m.label_rates || { day: {}, night: {} };
   const pushText = m.push_count ? m.push_count + ' seen' : 'none yet';
   const tiles = [
     ['Events today', m.events_today, m.events_7d + ' in 7 days'],
+    ['Events fired today', m.events_fired_today || 0, 'events that started water'],
     ['Runs today', m.runs_today, m.runs_7d + ' in 7 days'],
+    ['Valve seconds today', num(m.valve_seconds_today, 0) + ' s', 'valve open time, not measured water'],
+    ['Valve seconds, 7 days', num(m.valve_seconds_7d, 0) + ' s', (m.valve_runs_7d || 0) + ' valve runs'],
+    flowTile(m.flow_7d),
     ['Spend this month', '$' + num(m.spend_month_usd, 4), (m.calls_month || 0) + ' classifier calls'],
     ['Push status', pushText, m.push_last_at ? 'last ' + localTime(m.push_last_at) : 'poll is the live path'],
     ['Clip delay median', m.clip_delay_median_s === null ? '-' : num(m.clip_delay_median_s, 0) + ' s', 'Ring event to clip on disk'],
@@ -197,19 +208,22 @@ function renderCharts(m) {
 
 // ---- table (spec 8.2, 8.3) -----------------------------------------------
 function actionPill(row) {
-  if (!row.action) return '<span class="pill skip">pending</span>';
-  const cls = row.action === 'fire' ? 'fire' : (row.action === 'defer' ? 'defer' : 'skip');
+  // No decision yet means the classifier has not answered. Nothing runs until it does.
+  if (!row.action) return '<span class="pill skip">waiting on the classifier</span>';
+  const cls = row.action === 'fire' ? 'fire' : 'skip';
   const dry = row.run_dry ? ' dry' : '';
   return '<span class="pill ' + cls + '">' + esc(row.action) + dry + '</span> <span class="note">' + esc(row.reason || '') + '</span>';
 }
 
+// Requested seconds, whether the cloud confirmed the valve opened, and flow only when the timer
+// actually reported it. Confirmed means commanded and acknowledged, not that water moved.
 function runCell(row) {
   if (!row.run_count) return '-';
-  if (row.run_dry) return 'dry run';
-  if (!row.run_confirmed) return 'no';
-  const secs = row.run_called_at && row.run_confirmed_at
-    ? ((Date.parse(row.run_confirmed_at) - Date.parse(row.run_called_at)) / 1000).toFixed(1) + ' s' : '';
-  return 'yes ' + secs;
+  const requested = row.run_requested_s == null ? '' : row.run_requested_s + ' s requested';
+  if (row.run_dry) return ['dry run', requested].filter(Boolean).join(', ');
+  const parts = [requested, 'confirmed ' + (row.run_confirmed ? 'yes' : 'no')].filter(Boolean);
+  if (row.run_flow !== null && row.run_flow !== undefined) parts.push('flow ' + (row.run_flow ? 'yes' : 'no'));
+  return parts.join(', ');
 }
 
 function clipDelay(row) {
@@ -262,7 +276,7 @@ function renderRows(events) {
       '<td data-h="Ring">' + esc(row.ring_label || 'none') + '</td>' +
       '<td data-h="Species">' + species + '</td>' +
       '<td data-h="Action">' + actionPill(row) + '</td>' +
-      '<td data-h="Run" class="hide">' + esc(runCell(row)) + '</td>' +
+      '<td data-h="Run">' + esc(runCell(row)) + '</td>' +
       '<td data-h="Clip delay" class="hide">' + esc(clipDelay(row)) + '</td>' +
       '<td data-h="Frames" class="nolabel">' + frameCells(row) + '</td>' +
       '<td data-h="Label" class="nolabel">' + labelCell(row) + '</td>' +
