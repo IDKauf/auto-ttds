@@ -19,6 +19,12 @@ export function readRachioKey(envFile) {
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * Every Rachio request is capped. stopIfPerson awaits stopWatering from inside the poll loop, so a
+ * socket that hangs would hold up polling, and polling is how the next human event arrives.
+ */
+export const RACHIO_TIMEOUT_MS = 10000;
+
+/**
  * detectFlow is the valve's capability flag, not a reading. All three valves report it false today,
  * so treating it as a measurement would record "no water moved" on every run when the honest answer
  * is that nothing was measured.
@@ -65,9 +71,10 @@ export function flowDetectedFrom(valve) {
 }
 
 export class Rachio {
-  constructor({ apiKey, fetchImpl = globalThis.fetch, valveBase = VALVE_BASE, publicBase = PUBLIC_BASE, sleep = sleepMs, now = () => Date.now() } = {}) {
+  constructor({ apiKey, fetchImpl = globalThis.fetch, valveBase = VALVE_BASE, publicBase = PUBLIC_BASE, sleep = sleepMs, now = () => Date.now(), timeoutMs = RACHIO_TIMEOUT_MS } = {}) {
     this.apiKey = apiKey;
     this.fetchImpl = fetchImpl;
+    this.timeoutMs = timeoutMs;
     this.valveBase = valveBase;
     this.publicBase = publicBase;
     this.sleep = sleep;
@@ -76,21 +83,36 @@ export class Rachio {
     this.callsToday = 0;
   }
 
+  /**
+   * One Rachio request, capped by an AbortController rather than AbortSignal.timeout, because that
+   * helper's timer does not hold the event loop open. The timer here is cleared the moment the
+   * request settles, so a healthy call costs nothing and a dead socket always ends.
+   */
   async call(method, url, body) {
     const t0 = this.now();
-    const res = await this.fetchImpl(url, {
-      method,
-      headers: { Authorization: `Bearer ${this.apiKey}`, 'Content-Type': 'application/json' },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
-    const ms = this.now() - t0;
-    this.callsToday += 1;
-    const text = await res.text();
-    let json = null;
-    try { json = text && text.trim().startsWith('{') ? JSON.parse(text) : null; } catch { json = null; }
-    if (res.status === 401 || res.status === 403) this.lastAuthError = `Rachio HTTP ${res.status}`;
-    else if (res.ok) this.lastAuthError = null;
-    return { status: res.status, ok: res.ok, ms, json, text: json ? null : text.slice(0, 200) };
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(new Error(`Rachio ${method} timed out after ${this.timeoutMs} ms`)),
+      this.timeoutMs,
+    );
+    try {
+      const res = await this.fetchImpl(url, {
+        method,
+        headers: { Authorization: `Bearer ${this.apiKey}`, 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: controller.signal,
+      });
+      const ms = this.now() - t0;
+      this.callsToday += 1;
+      const text = await res.text();
+      let json = null;
+      try { json = text && text.trim().startsWith('{') ? JSON.parse(text) : null; } catch { json = null; }
+      if (res.status === 401 || res.status === 403) this.lastAuthError = `Rachio HTTP ${res.status}`;
+      else if (res.ok) this.lastAuthError = null;
+      return { status: res.status, ok: res.ok, ms, json, text: json ? null : text.slice(0, 200) };
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   personInfo() { return this.call('GET', `${this.publicBase}/person/info`); }

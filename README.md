@@ -125,8 +125,17 @@ care whether they still exist in Home Assistant, so they can be deleted whenever
    a run only reaches a run that has already started, so a human push landing seconds before a
    classification finishes would otherwise open a valve with the person still in frame. That event
    is recorded as skip, reason `person`.
-9. It does not fire at an event that went stale while it waited. The `stale_after_s` cutoff is
-   applied again at the moment of decision, not only when the event was first seen.
+9. It does not water a person because a verdict arrived late. A classifier call can be in flight for
+   about 70 seconds at worst, a bounded request, the 30 second retry sleep, and a second bounded
+   request. If the stored label or the stored decision says person by the time that verdict lands,
+   the verdict cannot flip the decision to fire. The recent-sighting window above is 60 seconds by
+   default and would not have covered it, so this reads the durable record instead.
+10. It does not fire at an event that went stale while it waited. The `stale_after_s` cutoff, and
+    the rule that nothing created before this boot may fire, are both applied again at the moment of
+    decision, not only when the event was first seen.
+11. It does not let a human signal be downgraded or dropped. A human push overwrites a stored
+    non-human label, and a human push that carries no event id still stops the run and marks the
+    camera, because the fact that a person is there does not depend on Ring sending an id.
 
 ## Reliability
 
@@ -139,8 +148,13 @@ care whether they still exist in Home Assistant, so they can be deleted whenever
    that beats that path still ends the run, because every valve is started with a duration.
 4. A Claude API error is retried once after 30 seconds. If it fails again the verdict row stores the
    error, and the event is not classified again.
-5. A Rachio 401 or 403 is surfaced on `sensor.auto_ttds_health` as state `error`.
-6. Costs are recorded per local day from `usage.input_tokens` and `usage.output_tokens`, priced from
+5. A Rachio 401 or 403 is surfaced on `sensor.auto_ttds_health` as state `error`. Every Rachio
+   request is capped at 10 seconds, because the person stop awaits `stopWatering` from inside the
+   poll loop and a hung socket would otherwise hold up the polling that brings the next event.
+6. An event whose frames are named in the database but missing from disk is closed out as skip,
+   reason `classifier_error`, once it is past `stale_after_s`. Left alone it would sit at the front
+   of the classifier queue for good and starve every newer event.
+7. Costs are recorded per local day from `usage.input_tokens` and `usage.output_tokens`, priced from
    a table keyed by model. A dated model id in the response, such as `claude-haiku-4-5-20251001`,
    is matched back to its price row by prefix.
 
@@ -243,3 +257,9 @@ npm test
 
 Tests use `node --test` and the built-in `node:sqlite` module, so there is no native build step.
 Node prints `ExperimentalWarning: SQLite is an experimental feature` on start. That is expected.
+
+One test scans every file in `src` for a camera-capture call, so `getSnapshot`, `getNextSnapshot`
+and the force endpoint cannot come back by accident. It reads the source as text, so it would not
+catch a computed property such as `camera['get' + 'Snapshot']()`. Nothing in the add-on does that,
+and the rule that no camera is ever asked for a new picture is enforced by review as well as by the
+scan.

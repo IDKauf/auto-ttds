@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { Rachio, readRachioKey, flowDetectedFrom, VALVE_BASE, PUBLIC_BASE } from '../src/rachio.js';
+import { Rachio, readRachioKey, flowDetectedFrom, VALVE_BASE, PUBLIC_BASE, RACHIO_TIMEOUT_MS } from '../src/rachio.js';
 
 function mockFetch(handler) {
   const calls = [];
@@ -216,4 +216,33 @@ test('a run with no flow field reports flow as null, not as no water', async () 
   const res = await r.startAndConfirm('v1', 60, { onCleared: (p) => cleared.push(p) });
   assert.equal(res.flow, null);
   assert.equal(cleared[0].flow_detected, null);
+});
+
+test('every Rachio request carries a timeout, so a dead socket cannot hang the caller', async () => {
+  const seen = [];
+  const hanging = new Rachio({
+    apiKey: 'test-key',
+    timeoutMs: 20,
+    fetchImpl: (url, opts) => {
+      seen.push(opts.signal);
+      return new Promise((_, reject) => {
+        opts.signal.addEventListener('abort', () => reject(opts.signal.reason ?? new Error('aborted')));
+      });
+    },
+  });
+  const t0 = Date.now();
+  await assert.rejects(() => hanging.stopWatering('v1'), 'the call gives up rather than waiting forever');
+  const elapsed = Date.now() - t0;
+  assert.ok(elapsed < 500, `gave up at the timeout (took ${elapsed} ms)`);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].aborted, true, 'the request was aborted, not left open');
+
+  // The default is ten seconds, and a healthy call is untouched by it.
+  assert.equal(RACHIO_TIMEOUT_MS, 10000);
+  assert.equal(new Rachio({ apiKey: 'k' }).timeoutMs, 10000);
+  const ok = new Rachio({ apiKey: 'k', fetchImpl: async (url, opts) => {
+    assert.ok(opts.signal, 'a signal is always passed');
+    return { status: 200, ok: true, text: async () => '{}' };
+  } });
+  assert.equal((await ok.stopWatering('v1')).status, 200);
 });

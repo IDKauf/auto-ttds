@@ -240,6 +240,14 @@ class App {
     const id = ding.id === undefined || ding.id === null ? null : String(ding.id);
     this.db.insertPush({ received_at: nowIso(), camera_id: String(camera.id), raw_json: JSON.stringify(notification) });
     log.info(`push ${camera.name} category=${notification?.android_config?.category ?? '-'} detection=${ding.detection_type ?? '-'}`);
+    const human = isHumanLabel(ding.detection_type);
+    // Fix 4: the stop comes before the id guard. A push that carries no ding id still carries the
+    // fact that a person is at the camera, and that fact is what closes a valve. Nothing below
+    // this point can run without an id, so a person would otherwise be silently dropped.
+    if (human) {
+      this.markHuman(String(camera.id));
+      await this.stopIfPerson({ camera_id: String(camera.id), ring_label: 'human' });
+    }
     if (!id) return;
     const existing = this.db.getEvent(id);
     const known = Boolean(existing);
@@ -250,17 +258,15 @@ class App {
       first_seen_at: known ? undefined : nowIso(),
       source: known ? undefined : 'push',
       // The push enum has no animal value, so it must never overwrite a label the poll already has.
-      ring_label: existing?.ring_label ?? ding.detection_type ?? undefined,
+      // Fix 3: human is the exception. A person arriving late is the one signal that must always
+      // win, because every downstream guard reads the stored label.
+      ring_label: human ? 'human' : (existing?.ring_label ?? ding.detection_type ?? undefined),
       kind: ding.subtype ?? undefined,
       test: this.knobs().test_mode ? 1 : 0,
     });
-    const human = isHumanLabel(ding.detection_type);
     if (human) {
-      // A person stops whatever is running, always, and blocks anything about to start (fix 2).
       // The decision is only written when nothing has decided this event yet, so a push never
       // rewrites a decision the pipeline already made.
-      this.markHuman(String(camera.id));
-      await this.stopIfPerson({ camera_id: String(camera.id), ring_label: 'human' });
       if (!this.db.getDecision(id)) await this.runDecision(id, RING_PERSON_VERDICT);
       return;
     }
@@ -301,6 +307,10 @@ class App {
     // No await stands between this read and upsertDecision on any skip path.
     const event = this.db.getEvent(eventId);
     if (!event) return;
+    // Read alongside the row, for the person guard below. A classify() call can be in flight for up
+    // to about 70 s (a 20 s request, a 30 s sleep, a second 20 s request), and the label or the
+    // decision can change under it in that time.
+    const prior = this.db.getDecision(eventId);
     const knobs = this.knobs();
     const valves = resolveValves(event.camera_id, knobs.valve_map, this.valves.map((v) => v.id));
     const state = { ...this.db.decisionState(), now: Date.now(), program_running: false };
@@ -313,10 +323,22 @@ class App {
     // half an hour waiting for a clip, and firing at an animal that has long gone wastes water and
     // is the opposite of what this add-on is for. Same stale_after_s option, no new knob. Only a
     // fire is converted, so every decide() reason stays exactly as decide() wrote it.
-    if (result.action === 'fire' && isStale(event, { now: state.now, staleAfterS: this.opts.stale_after_s })) {
+    if (result.action === 'fire' && isStale(event, {
+      now: state.now, processStartedAt: this.startedAt, staleAfterS: this.opts.stale_after_s,
+    })) {
       const ageS = Math.round((state.now - Date.parse(event.ring_created_at ?? event.first_seen_at)) / 1000);
       log.warning(`refusing to fire ${eventId}: the event is ${ageS} s old, past stale_after_s`);
       result = { ...result, action: 'skip', reason: 'stale' };
+    }
+
+    // Blocker fix: the event is a person, whatever this verdict says. A push can start a classify,
+    // the poll can then enrich the label to human and write skip/person, and the verdict can land
+    // a minute later. Without this the decision would flip to fire and open a valve on a person.
+    // lastHumanAt cannot cover it: that window is run_seconds, shorter than the classifier's worst
+    // case. This reads the row and the decision as they stand now, which is the durable record.
+    if (result.action === 'fire' && (isHumanLabel(event.ring_label) || prior?.reason === 'person')) {
+      log.warning(`refusing to fire ${eventId}: it is recorded as a person, so this verdict is stale`);
+      result = { ...result, action: 'skip', reason: 'person' };
     }
 
     // Fix 2: a person seen on this camera within the run that is about to start. stopActiveRuns
@@ -511,7 +533,18 @@ class App {
     if (!event) return;
     if (this.db.getVerdict(eventId) || this.db.getDecision(eventId)) return;
     const images = this.imagesFor(event);
-    if (!images.length) return;
+    if (!images.length) {
+      // A row can name frames that are not on disk, for example media deleted underneath us. Such a
+      // row has no verdict and no decision, so it would sit at the front of the verdict queue for
+      // good and starve every newer event. Once it is past stale_after_s no image is coming and it
+      // could not fire anyway, so it is closed out here.
+      if (isStale(event, { now: Date.now(), processStartedAt: this.startedAt, staleAfterS: this.opts.stale_after_s })) {
+        await this.recordSkip(eventId, 'classifier_error', {
+          error: 'no image ever arrived', frames_json: event.frames_json ?? null, snapshot_path: event.snapshot_path ?? null,
+        });
+      }
+      return;
+    }
 
     this.classifying.add(eventId);
     try {
