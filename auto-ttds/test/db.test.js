@@ -47,7 +47,7 @@ test('verdict, decision, run and label round trip', () => {
   db.upsertVerdict({ event_id: 'e1', model: 'claude-haiku-4-5', species: 'coyote', count: 1, is_person: 0, friendly: 0, confidence: 0.8, frames_agree: null, raw_json: '{}', input_tokens: 2200, output_tokens: 120, usd: 0.0028, latency_ms: 900, at: iso(), error: null });
   assert.equal(db.getVerdict('e1').species, 'coyote');
 
-  db.upsertDecision({ event_id: 'e1', at: iso(), action: 'fire', reason: 'target', mode: 'immediate', knobs_json: '{}' });
+  db.upsertDecision({ event_id: 'e1', at: iso(), action: 'fire', reason: 'target', knobs_json: '{}' });
   assert.equal(db.getDecision('e1').action, 'fire');
 
   const runId = db.insertRun({ event_id: 'e1', valve_id: 'v1', valve_name: 'Hose Sprinkler 1', requested_s: 60, called_at: iso(), dry_run: 0 });
@@ -79,8 +79,8 @@ test('cost accumulation is per day', () => {
 
 test('listEvents filters', () => {
   const db = seed();
-  db.upsertDecision({ event_id: 'e1', at: iso(), action: 'fire', reason: 'target', mode: 'immediate', knobs_json: '{}' });
-  db.upsertDecision({ event_id: 'e2', at: iso(), action: 'skip', reason: 'person', mode: 'immediate', knobs_json: '{}' });
+  db.upsertDecision({ event_id: 'e1', at: iso(), action: 'fire', reason: 'target', knobs_json: '{}' });
+  db.upsertDecision({ event_id: 'e2', at: iso(), action: 'skip', reason: 'person', knobs_json: '{}' });
   db.upsertLabel({ event_id: 'e1', by: 'ingress', should_have_fired: 1, actual: null, note: null, at: iso() });
 
   assert.equal(db.listEvents({}).length, 2);
@@ -93,7 +93,7 @@ test('listEvents filters', () => {
   assert.equal(unlabeled.length, 1, 'unlabeled means no answer to should_have_fired');
   assert.equal(unlabeled[0].event_id, 'e2');
   assert.equal(db.listEvents({ camera: '639481050' })[0].should_have_fired, 1);
-  assert.equal(db.listEvents({ camera: '639481050' })[0].labeled, 1);
+  assert.equal(db.listEvents({ camera: '639481050' })[0].labeled, undefined, 'v0.4: nothing reads the labeled flag');
   assert.equal(db.listEvents({ limit: 1 }).length, 1);
   // newest first
   assert.equal(db.listEvents({})[0].event_id, 'e2');
@@ -130,7 +130,7 @@ test('label rates come from should_have_fired, split day and night', () => {
   const mk = (id, hourLocal, action, shouldHaveFired) => {
     const d = new Date(); d.setHours(hourLocal, 0, 0, 0);
     db.insertEvent({ event_id: id, camera_id: 'c', ring_created_at: d.toISOString(), first_seen_at: d.toISOString(), source: 'poll', test: 0 });
-    db.upsertDecision({ event_id: id, at: d.toISOString(), action, reason: 'target', mode: 'immediate', knobs_json: '{}' });
+    db.upsertDecision({ event_id: id, at: d.toISOString(), action, reason: 'target', knobs_json: '{}' });
     db.upsertLabel({ event_id: id, by: 't', should_have_fired: shouldHaveFired, actual: null, note: null, at: d.toISOString() });
   };
   mk('d1', 12, 'fire', 1);   // fired and wanted: neither numerator
@@ -155,7 +155,7 @@ test('an event labeled only with a species counts in neither rate', () => {
   const db = new Db(':memory:');
   const at = new Date(); at.setHours(12, 0, 0, 0);
   db.insertEvent({ event_id: 'u1', camera_id: 'c', ring_created_at: at.toISOString(), first_seen_at: at.toISOString(), source: 'poll', test: 0 });
-  db.upsertDecision({ event_id: 'u1', at: at.toISOString(), action: 'fire', reason: 'target', mode: 'immediate', knobs_json: '{}' });
+  db.upsertDecision({ event_id: 'u1', at: at.toISOString(), action: 'fire', reason: 'target', knobs_json: '{}' });
   db.upsertLabel({ event_id: 'u1', by: 't', actual: 'cat', note: 'no verdict on whether it should have fired', at: at.toISOString() });
   const r = db.labelRates();
   assert.equal(r.day.fired, 0, 'an unlabeled event is never counted as correct');
@@ -249,7 +249,7 @@ test('the upgrade carries v0.1 labels over into should_have_fired', () => {
 
 test('deleting test events removes their children and reports their media (review item 16)', () => {
   const db = seed();
-  db.upsertDecision({ event_id: 'e2', at: iso(), action: 'skip', reason: 'person', mode: 'immediate', knobs_json: '{}' });
+  db.upsertDecision({ event_id: 'e2', at: iso(), action: 'skip', reason: 'person', knobs_json: '{}' });
   db.insertRun({ event_id: 'e2', valve_id: 'v1', requested_s: 5, called_at: iso(), dry_run: 1 });
   db.updateEvent('e2', { clip_path: '/share/auto-ttds/clips/73991832/c.mp4', frames_json: '["e2_t1.jpg","e2_t3.jpg"]', snapshot_path: '/share/auto-ttds/frames/e2_snapshot.jpg' });
   const res = db.deleteTestEvents();
@@ -289,7 +289,7 @@ test('ineligible events cannot starve the verdict queue (review item 4)', () => 
   add('x4', '639481050', null, -3000); // decided already, below
   add('good1', '639481050', null, -2000); // v0.3: no Ring label is no longer a reason to skip it
   add('good2', '639481050', 'other_motion', -1000);
-  db.upsertDecision({ event_id: 'x4', at: iso(), action: 'skip', reason: 'stale', mode: 'immediate', knobs_json: '{}' });
+  db.upsertDecision({ event_id: 'x4', at: iso(), action: 'skip', reason: 'stale', knobs_json: '{}' });
 
   assert.deepEqual(db.eventsAwaitingVerdict(green, 3).map((r) => r.event_id), ['good1', 'good2']);
 
@@ -442,5 +442,130 @@ test('a run row carries its requested seconds and flow to the page', () => {
   db.updateRun(2, { flow_detected: 1 });
   row = db.listEvents({ camera: '639481050' })[0];
   assert.equal(row.run_flow, 1);
+  db.close();
+});
+
+// ---- v0.4 timeline ---------------------------------------------------------
+
+test('an existing database gains the v0.4 timeline columns in place, and only once', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ttds-timeline-'));
+  const file = path.join(dir, 'auto-ttds.db');
+  const old = new DatabaseSync(file);
+  old.exec(`CREATE TABLE events (event_id TEXT PRIMARY KEY, camera_id TEXT, camera_name TEXT,
+    ring_created_at TEXT, first_seen_at TEXT, source TEXT, kind TEXT, ring_label TEXT,
+    ring_labels_json TEXT, recording_status TEXT, clip_path TEXT, clip_ready_at TEXT,
+    frames_json TEXT, snapshot_path TEXT, test INTEGER DEFAULT 0, raw_json TEXT)`);
+  // The v0.3 decisions table still carries the mode column the knob used to fill.
+  old.exec('CREATE TABLE decisions (event_id TEXT PRIMARY KEY, at TEXT, action TEXT, reason TEXT, mode TEXT, knobs_json TEXT)');
+  old.prepare("INSERT INTO events (event_id, camera_id, ring_created_at, first_seen_at, source, test) VALUES ('o1','c','2026-09-01T00:00:00.000Z','2026-09-01T00:00:00.000Z','poll',0)").run();
+  old.close();
+
+  const db = new Db(file);
+  assert.equal(db.migrations.image_source_added, true);
+  assert.equal(db.migrations.image_ready_at_added, true);
+  assert.equal(db.migrations.trigger_latency_ms_added, true);
+  assert.equal(db.getEvent('o1').image_source, null, 'an old event claims no image source');
+
+  // A leftover mode column must not break the write that no longer fills it.
+  db.upsertDecision({ event_id: 'o1', at: iso(), action: 'fire', reason: 'target', knobs_json: '{}' });
+  assert.equal(db.getDecision('o1').action, 'fire');
+  assert.equal(db.getDecision('o1').mode, null, 'the column is left behind, empty');
+  assert.equal(db.getDecision('o1').trigger_latency_ms, null);
+  db.updateEvent('o1', { image_source: 'clip_frames', image_ready_at: iso() });
+  assert.equal(db.getEvent('o1').image_source, 'clip_frames');
+  db.close();
+
+  const second = new Db(file);
+  assert.equal(second.migrations.image_source_added, false, 'the migration is idempotent');
+  assert.equal(second.migrations.trigger_latency_ms_added, false);
+  assert.equal(second.getEvent('o1').image_source, 'clip_frames');
+  second.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('trigger latency is written once, by the first valve to issue a call', () => {
+  const db = seed();
+  db.upsertDecision({ event_id: 'e1', at: iso(), action: 'fire', reason: 'target', knobs_json: '{}' });
+  assert.equal(db.getDecision('e1').trigger_latency_ms, null, 'null until something actually fires');
+  db.setTriggerLatency('e1', 11200);
+  db.setTriggerLatency('e1', 11800); // the second valve, a moment later
+  assert.equal(db.getDecision('e1').trigger_latency_ms, 11200, 'the first call is the one timed');
+  db.setTriggerLatency('e1', NaN);
+  db.setTriggerLatency('missing', 500); // no decision row, no row written
+  assert.equal(db.getDecision('e1').trigger_latency_ms, 11200);
+  assert.equal(db.getDecision('missing'), null);
+  db.close();
+});
+
+test('the median trigger latency reads only events that fired, inside the window', () => {
+  const db = new Db(':memory:');
+  const add = (id, createdOffsetMs, ms) => {
+    const at = iso(createdOffsetMs);
+    db.insertEvent({ event_id: id, camera_id: 'c', ring_created_at: at, first_seen_at: at, source: 'poll', test: 0 });
+    db.upsertDecision({ event_id: id, at, action: ms === null ? 'skip' : 'fire', reason: 'target', knobs_json: '{}' });
+    if (ms !== null) db.setTriggerLatency(id, ms);
+  };
+  const weekStart = new Date(Date.now() - 7 * 86400000).toISOString();
+  add('a', -1000, 9000);
+  add('b', -2000, 11000);
+  add('c', -3000, null); // skipped: no figure to report
+  add('old', -8 * 86400000, 40000); // outside the 7 day window
+  assert.deepEqual(db.triggerLatenciesMsSince(weekStart).sort((x, y) => x - y), [9000, 11000]);
+  assert.equal(median(db.triggerLatenciesMsSince(weekStart)), 10000);
+  assert.deepEqual(db.triggerLatenciesMsSince(iso(60000)), []);
+  db.close();
+});
+
+test('events split by the image the classifier actually read', () => {
+  const db = new Db(':memory:');
+  const add = (id, source) => {
+    const at = iso(-1000);
+    db.insertEvent({ event_id: id, camera_id: 'c', ring_created_at: at, first_seen_at: at, source: 'poll', test: 0, image_source: source });
+  };
+  add('p1', 'push_snapshot');
+  add('c1', 'clip_frames');
+  add('c2', 'clip_frames');
+  add('n1', null); // no image yet, so nothing was classified from anything
+  const weekStart = new Date(Date.now() - 7 * 86400000).toISOString();
+  assert.deepEqual(db.imageSourceCountsSince(weekStart), {
+    push_snapshot: 1, clip_frames: 2, none: 1,
+  }, 'the two real routes, and the events that have neither yet');
+  db.close();
+});
+
+test('the event row carries its image source and trigger latency to the page', () => {
+  const db = seed();
+  db.updateEvent('e1', { image_source: 'push_snapshot', image_ready_at: iso() });
+  db.upsertDecision({ event_id: 'e1', at: iso(), action: 'fire', reason: 'target', knobs_json: '{}' });
+  db.setTriggerLatency('e1', 10400);
+  const row = db.listEvents({ camera: '639481050' })[0];
+  assert.equal(row.image_source, 'push_snapshot');
+  assert.ok(row.image_ready_at);
+  assert.equal(row.trigger_latency_ms, 10400);
+  assert.equal(row.mode, undefined, 'v0.4: the page is served no mode');
+  db.close();
+});
+
+test('fix 3: rows whose clip yielded no frames cannot starve the verdict queue', () => {
+  const db = new Db(':memory:');
+  const green = ['639481050'];
+  const add = (id, offsetMs, over = {}) => db.insertEvent({
+    event_id: id, camera_id: '639481050', camera_name: 'c', ring_created_at: iso(offsetMs),
+    first_seen_at: iso(offsetMs), source: 'poll', kind: 'motion', ring_label: 'animal',
+    recording_status: 'ready', test: 0, raw_json: '{}', ...over,
+  });
+  // Five clips ffmpeg could not read, all older than the event that matters, with a window of 5.
+  for (let i = 0; i < 5; i += 1) add(`empty${i}`, -10000 + i * 100, { frames_json: '[]' });
+  add('real1', -1000, { frames_json: '["real1_t1.jpg"]' });
+  add('real2', -900, { snapshot_path: '/f/real2_snapshot.jpg' });
+
+  const queued = db.eventsAwaitingVerdict(green, 5).map((r) => r.event_id);
+  assert.deepEqual(queued, ['real1', 'real2'], 'an empty frames list is not media');
+
+  // The rows themselves are untouched, they are simply not classifiable.
+  assert.equal(db.getEvent('empty0').frames_json, '[]');
+  // A row that never got as far as a frames_json is still out too.
+  add('null1', -800);
+  assert.deepEqual(db.eventsAwaitingVerdict(green, 5).map((r) => r.event_id), ['real1', 'real2']);
   db.close();
 });

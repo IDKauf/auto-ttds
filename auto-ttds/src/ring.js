@@ -32,10 +32,21 @@ export function persistRefreshToken(tokenFile, refreshToken) {
   try { fs.chmodSync(tokenFile, 0o600); } catch { /* best effort on odd filesystems */ }
 }
 
-/** Map one Ring events-API entry onto an events row (spec 5). */
+/** True when this label, in either shape, is Ring's word for a person. */
+const isHuman = (label) => String(label ?? '').trim().toLowerCase() === 'human';
+
+/**
+ * Map one Ring events-API entry onto an events row (spec 5).
+ *
+ * Fix 4: Ring sometimes carries the human label only inside cv_properties.detection_types, with
+ * the scalar detection_type saying something else or nothing at all. Reading the scalar alone made
+ * such an event non-human, which both paid for a classifier call the rule says a person never
+ * costs and lost the stop-on-human signal. The array counts as much as the scalar.
+ */
 export function eventRow(camera, e, source, nowIso = new Date().toISOString()) {
   const cv = e.cv_properties ?? {};
   const labels = (cv.detection_types ?? []).map((x) => (typeof x === 'string' ? x : x?.detection_type)).filter(Boolean);
+  const human = isHuman(cv.detection_type) || labels.some(isHuman);
   return {
     event_id: String(e.event_id),
     camera_id: String(camera.id),
@@ -44,7 +55,7 @@ export function eventRow(camera, e, source, nowIso = new Date().toISOString()) {
     first_seen_at: nowIso,
     source,
     kind: e.kind ?? null,
-    ring_label: cv.detection_type ?? null,
+    ring_label: human ? 'human' : (cv.detection_type ?? null),
     ring_labels_json: JSON.stringify(labels),
     recording_status: e.recording_status ?? null,
     test: 0,
@@ -189,11 +200,19 @@ export class RingIngest {
     return out;
   }
 
-  /** Push snapshot by uuid (spec 6.3). Returns the saved path or null. */
+  /**
+   * Push snapshot by uuid (spec 6.3). Returns the saved path or null.
+   *
+   * getSnapshotByUuid, never getSnapshot. Both fetch an image, but getSnapshot with no uuid asks
+   * app-snaps.ring.com for the NEXT snapshot with extras=force, which tells the camera to take a
+   * new picture. getSnapshotByUuid hits the clientApi snapshots/uuid endpoint, which can only ever
+   * return an image Ring already captured at detection. Nothing in this add-on wakes a camera.
+   */
   async saveSnapshot(camera, eventId, uuid) {
-    if (!uuid || typeof camera.getSnapshot !== 'function') return null;
+    if (!uuid || typeof camera?.getSnapshotByUuid !== 'function') return null;
     try {
-      const buf = await camera.getSnapshot({ uuid });
+      const buf = await camera.getSnapshotByUuid(uuid);
+      if (!buf) return null;
       const out = path.join(this.dataDir, 'frames', `${eventId}_snapshot.jpg`);
       fs.mkdirSync(path.dirname(out), { recursive: true });
       fs.writeFileSync(out, buf);

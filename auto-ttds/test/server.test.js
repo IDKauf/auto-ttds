@@ -18,10 +18,10 @@ async function withServer(fn) {
 
   const db = new Db(':memory:');
   db.insertEvent({ event_id: 'e1', camera_id: '639481050', camera_name: 'Cat Cam', ring_created_at: iso(-1000), first_seen_at: iso(-1000), source: 'poll', kind: 'motion', ring_label: 'animal', recording_status: 'ready', frames_json: '["e1_t1.jpg"]', test: 0, raw_json: '{}' });
-  db.upsertDecision({ event_id: 'e1', at: iso(), action: 'fire', reason: 'target', mode: 'immediate', knobs_json: '{}' });
+  db.upsertDecision({ event_id: 'e1', at: iso(), action: 'fire', reason: 'target', knobs_json: '{}' });
   db.addCost(iso().slice(0, 10), 2200, 120, 0.0028);
 
-  const server = createServer({ db, dataDir, knobStore: { get: () => ({ mode: 'immediate' }), lastRefreshAt: iso() }, healthRef: { value: { state: 'ok' } } });
+  const server = createServer({ db, dataDir, knobStore: { get: () => ({ enabled: true, dry_run: false }), lastRefreshAt: iso() }, healthRef: { value: { state: 'ok' } } });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const base = `http://127.0.0.1:${server.address().port}`;
   try { await fn({ base, db, dataDir }); } finally {
@@ -62,7 +62,7 @@ test('GET /api/metrics carries the tiles and the chart series', async () => {
     }
     assert.equal(m.events_today, 1);
     assert.equal(Number(m.spend_month_usd.toFixed(4)), 0.0028);
-    assert.equal(m.knobs.mode, 'immediate');
+    assert.equal(m.knobs.enabled, true);
   });
 });
 
@@ -269,4 +269,61 @@ test('buildMetrics works on an empty database', () => {
   assert.equal(m.clip_delay_median_s, null);
   assert.equal(m.label_rates.day.falseSprayRate, null);
   db.close();
+});
+
+// ---- v0.4: the timeline on the page ----------------------------------------
+
+test('GET /api/metrics carries the trigger latency and the image source split', async () => {
+  await withServer(async ({ base, db }) => {
+    let m = await (await fetch(`${base}/api/metrics`)).json();
+    for (const key of ['trigger_latency_median_ms', 'trigger_latency_count_7d', 'image_source_7d']) {
+      assert.ok(key in m, `metrics has ${key}`);
+    }
+    assert.equal(m.trigger_latency_median_ms, null, 'null until something fires');
+    assert.equal(m.trigger_latency_count_7d, 0);
+    assert.deepEqual(m.image_source_7d, { push_snapshot: 0, clip_frames: 0, none: 1 });
+
+    db.updateEvent('e1', { image_source: 'clip_frames', image_ready_at: iso() });
+    db.setTriggerLatency('e1', 10400);
+    db.insertEvent({ event_id: 'e2', camera_id: '639481050', ring_created_at: iso(-2000), first_seen_at: iso(-2000), source: 'push', test: 0, image_source: 'push_snapshot' });
+    db.upsertDecision({ event_id: 'e2', at: iso(), action: 'fire', reason: 'target', knobs_json: '{}' });
+    db.setTriggerLatency('e2', 9600);
+
+    m = await (await fetch(`${base}/api/metrics`)).json();
+    assert.equal(m.trigger_latency_median_ms, 10000, 'the median of 9.6 s and 10.4 s');
+    assert.equal(m.trigger_latency_count_7d, 2);
+    assert.deepEqual(m.image_source_7d, { push_snapshot: 1, clip_frames: 1, none: 0 }, 'the real two way split');
+  });
+});
+
+test('GET /api/events carries the image source and the trigger latency', async () => {
+  await withServer(async ({ base, db }) => {
+    db.updateEvent('e1', { image_source: 'clip_frames', image_ready_at: iso() });
+    db.setTriggerLatency('e1', 10400);
+    const rows = await (await fetch(`${base}/api/events`)).json();
+    assert.equal(rows.events[0].image_source, 'clip_frames');
+    assert.equal(rows.events[0].trigger_latency_ms, 10400);
+    assert.equal(rows.events[0].mode, undefined, 'the removed knob is served to nobody');
+    assert.equal(rows.events[0].labeled, undefined, 'and neither is the unused labeled flag');
+  });
+});
+
+test('the page shows the timeline: two tiles and an image column (v0.4)', () => {
+  const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
+  assert.match(html, /Trigger latency median/);
+  assert.match(html, /Ring event to valve command/);
+  assert.match(html, /Image source, 7 days/);
+  assert.match(html, /push snapshot, clip frames/);
+  assert.match(html, /<th>Image<\/th>/);
+  assert.match(html, /data-h="Image"/);
+  assert.match(html, /fired in /);
+  assert.ok(!/fresh.snapshot/i.test(html), 'the live snapshot route is gone from the page');
+  assert.ok(!/—/.test(html), 'no em dashes in the page');
+});
+
+test('the page has no mode left to show (v0.4)', () => {
+  const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
+  assert.ok(!/k\.mode/.test(html), 'the status line no longer reads a knob that does nothing');
+  assert.ok(!/classifier_max_wait/.test(html));
+  assert.match(html, /k\.enabled === false \? 'disabled' : 'enabled'/);
 });

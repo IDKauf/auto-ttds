@@ -5,20 +5,25 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const SCHEMA = `
+-- events.image_source (v0.4): which image the classifier actually saw, push_snapshot or
+-- clip_frames. events.image_ready_at is when that image landed on disk.
 CREATE TABLE IF NOT EXISTS events (
   event_id TEXT PRIMARY KEY, camera_id TEXT, camera_name TEXT, ring_created_at TEXT, first_seen_at TEXT,
   source TEXT, kind TEXT, ring_label TEXT, ring_labels_json TEXT, recording_status TEXT,
   clip_path TEXT, clip_ready_at TEXT, frames_json TEXT, snapshot_path TEXT,
-  test INTEGER DEFAULT 0, raw_json TEXT);
+  test INTEGER DEFAULT 0, raw_json TEXT, image_source TEXT, image_ready_at TEXT);
 CREATE TABLE IF NOT EXISTS verdicts (
   event_id TEXT PRIMARY KEY, model TEXT, species TEXT, count INTEGER, is_person INTEGER, friendly INTEGER,
   confidence REAL, frames_agree INTEGER, raw_json TEXT, input_tokens INTEGER, output_tokens INTEGER,
   usd REAL, latency_ms INTEGER, at TEXT, error TEXT);
 -- decisions.reason: target | non_target | not_greenlisted | person | no_animal | friendly | cooldown |
---   cap | blackout | program_running | disabled | dry_run | test | no_verdict_timeout | stale |
---   classifier_error
+--   cap | blackout | program_running | disabled | dry_run | test | stale | classifier_error
+-- decisions.trigger_latency_ms (v0.4): events.ring_created_at to the moment the first startWatering
+-- call was issued for this event. NULL when nothing fired, and NULL on a dry run, which issues no
+-- call at all. v0.4 dropped the mode column with the knob that fed it.
 CREATE TABLE IF NOT EXISTS decisions (
-  event_id TEXT PRIMARY KEY, at TEXT, action TEXT, reason TEXT, mode TEXT, knobs_json TEXT);
+  event_id TEXT PRIMARY KEY, at TEXT, action TEXT, reason TEXT, knobs_json TEXT,
+  trigger_latency_ms INTEGER);
 -- runs.flow_detected (v0.3): 1 water moved, 0 it did not, NULL the timer reported no flow field.
 -- Every valve on this base station reports detectFlow false today, so this column is NULL in
 -- practice. It fills itself in if flow detection is ever switched on (rachio.js flowDetectedFrom).
@@ -46,7 +51,8 @@ CREATE INDEX IF NOT EXISTS runs_called ON runs(called_at);
 
 const EVENT_COLS = ['event_id', 'camera_id', 'camera_name', 'ring_created_at', 'first_seen_at', 'source',
   'kind', 'ring_label', 'ring_labels_json', 'recording_status', 'clip_path', 'clip_ready_at',
-  'frames_json', 'snapshot_path', 'test', 'raw_json'];
+  'frames_json', 'snapshot_path', 'test', 'raw_json', 'image_source', 'image_ready_at'];
+
 
 const VERDICT_COLS = ['event_id', 'model', 'species', 'count', 'is_person', 'friendly', 'confidence',
   'frames_agree', 'raw_json', 'input_tokens', 'output_tokens', 'usd', 'latency_ms', 'at', 'error'];
@@ -126,9 +132,16 @@ export class Db {
   migrate() {
     const added = this.addColumn('labels', 'should_have_fired', 'INTEGER'); // v0.2
     const flow = this.addColumn('runs', 'flow_detected', 'INTEGER'); // v0.3
+    // v0.4, same PRAGMA-guarded pattern: the timeline columns.
+    const imageSource = this.addColumn('events', 'image_source', 'TEXT');
+    const imageReadyAt = this.addColumn('events', 'image_ready_at', 'TEXT');
+    const triggerLatency = this.addColumn('decisions', 'trigger_latency_ms', 'INTEGER');
     return {
       should_have_fired_backfilled: added ? this.backfillShouldHaveFired() : 0,
       flow_detected_added: flow,
+      image_source_added: imageSource,
+      image_ready_at_added: imageReadyAt,
+      trigger_latency_ms_added: triggerLatency,
     };
   }
 
@@ -223,6 +236,10 @@ export class Db {
    * Ineligible means: camera off the greenlist, Ring already called it human (decided for free), or
    * a decision already exists (stale, not_greenlisted, person). An existing verdict row excludes the
    * event whether or not it holds an error, because classify() already made its one in-call retry.
+   *
+   * Fix 3: an empty frames list is not media. A clip ffmpeg could not read writes frames_json as
+   * "[]", and a row with no image is left alone by classifyEvent without a verdict being written,
+   * so such rows would otherwise sit at the front of this window forever and starve real events.
    */
   eventsAwaitingVerdict(greenCameraIds = [], limit = 10) {
     const green = (greenCameraIds ?? []).map(String).filter(Boolean);
@@ -233,7 +250,7 @@ export class Db {
        LEFT JOIN verdicts v ON v.event_id = e.event_id
        LEFT JOIN decisions d ON d.event_id = e.event_id
        WHERE v.event_id IS NULL AND d.event_id IS NULL
-         AND (e.frames_json IS NOT NULL OR e.snapshot_path IS NOT NULL)
+         AND (IFNULL(e.frames_json, '[]') != '[]' OR e.snapshot_path IS NOT NULL)
          AND e.camera_id IN (${marks})
          AND LOWER(IFNULL(e.ring_label, '')) != 'human'
        ORDER BY e.first_seen_at ASC LIMIT ?`, ...green, limit,
@@ -253,10 +270,23 @@ export class Db {
 
   upsertDecision(row) {
     this.run(
-      `INSERT INTO decisions (event_id, at, action, reason, mode, knobs_json) VALUES (?, ?, ?, ?, ?, ?)
+      `INSERT INTO decisions (event_id, at, action, reason, knobs_json) VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(event_id) DO UPDATE SET at=excluded.at, action=excluded.action, reason=excluded.reason,
-       mode=excluded.mode, knobs_json=excluded.knobs_json`,
-      row.event_id, row.at, row.action, row.reason, row.mode, row.knobs_json,
+       knobs_json=excluded.knobs_json`,
+      row.event_id, row.at, row.action, row.reason, row.knobs_json,
+    );
+  }
+
+  /**
+   * setTriggerLatency: how long the whole pipeline took, in milliseconds, from the Ring event to the
+   * first startWatering call for this event. Written once, by the first valve to issue a call, so a
+   * second valve on the same event never overwrites the figure that matters.
+   */
+  setTriggerLatency(eventId, ms) {
+    if (!Number.isFinite(Number(ms))) return;
+    this.run(
+      'UPDATE decisions SET trigger_latency_ms = ? WHERE event_id = ? AND trigger_latency_ms IS NULL',
+      Math.round(Number(ms)), eventId,
     );
   }
 
@@ -392,6 +422,31 @@ export class Db {
     return { runs: Number(row?.runs ?? 0), yes, no, unknown: Number(row?.unknown ?? 0), reported: yes + no > 0 };
   }
 
+  // ---- timeline (v0.4) --------------------------------------------------
+  /**
+   * triggerLatenciesMsSince: every recorded Ring-event-to-first-valve-command figure since `iso`,
+   * as milliseconds. Only events that actually started water have one, so this is the real spread
+   * of the delay Ian cares about and nothing else.
+   */
+  triggerLatenciesMsSince(iso) {
+    return this.all(
+      `SELECT d.trigger_latency_ms AS ms FROM decisions d
+       JOIN events e ON e.event_id = d.event_id
+       WHERE d.trigger_latency_ms IS NOT NULL AND e.ring_created_at >= ?`, iso,
+    ).map((r) => Number(r.ms)).filter((n) => Number.isFinite(n));
+  }
+
+  /** imageSourceCountsSince: how many events were decided from each kind of image. */
+  imageSourceCountsSince(iso) {
+    const out = { push_snapshot: 0, clip_frames: 0, none: 0 };
+    const rows = this.all(
+      `SELECT IFNULL(image_source, 'none') AS src, COUNT(*) AS n FROM events
+       WHERE ring_created_at >= ? GROUP BY src`, iso,
+    );
+    for (const r of rows) out[r.src] = (out[r.src] ?? 0) + Number(r.n);
+    return out;
+  }
+
   // ---- page queries -----------------------------------------------------
   listEvents(filters = {}) {
     const where = [];
@@ -405,10 +460,9 @@ export class Db {
     if (filters.unlabeled) where.push('l.should_have_fired IS NULL');
     const limit = Math.min(1000, Math.max(1, Number(filters.limit) || 200));
     return this.all(
-      `SELECT e.*, d.action, d.reason, d.mode, d.knobs_json, d.at AS decided_at,
+      `SELECT e.*, d.action, d.reason, d.knobs_json, d.at AS decided_at, d.trigger_latency_ms,
               v.species, v.confidence, v.is_person, v.friendly AS verdict_friendly, v.usd, v.error AS verdict_error,
               l.correct, l.actual, l.friendly AS label_friendly, l.note, l.should_have_fired,
-              (l.event_id IS NOT NULL) AS labeled,
               (SELECT COUNT(*) FROM runs r WHERE r.event_id = e.event_id) AS run_count,
               (SELECT COUNT(*) FROM runs r WHERE r.event_id = e.event_id AND r.confirmed_at IS NOT NULL) AS run_confirmed,
               (SELECT MIN(r.called_at) FROM runs r WHERE r.event_id = e.event_id) AS run_called_at,

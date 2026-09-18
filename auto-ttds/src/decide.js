@@ -4,6 +4,8 @@
 // v0.3 moved the classifier in front of the decision. decide() now reads the classifier species and
 // never the Ring label: Ring's own label only decides whether an event is a person, which main.js
 // handles before it spends anything on a classifier call.
+// v0.4 dropped the mode knob and the no_verdict_timeout reason. Neither had any effect on anything
+// this function returned.
 
 // Every reason string the decisions table may hold (db.js, decisions.reason).
 export const REASONS = [
@@ -20,7 +22,6 @@ export const REASONS = [
   'disabled',
   'dry_run',
   'test',
-  'no_verdict_timeout', // v0.2 slot, kept so old rows still read; v0.3 never emits it
   'stale', // an event older than the backlog window never fires
   'classifier_error', // v0.3: no classification means no water, ever
 ];
@@ -65,14 +66,12 @@ export function decide(event, verdict, knobs, state) {
   const k = knobs ?? {};
   const s = state ?? {};
   const now = ms(s.now ?? Date.now());
-  const mode = k.mode === 'classifier_wait' ? 'classifier_wait' : 'immediate';
   const out = (action, reason, extra = {}) => ({
     action,
     reason,
     test: Boolean(k.test_mode),
     dryRun: Boolean(k.dry_run),
     warnings,
-    mode,
     ...extra,
   });
 

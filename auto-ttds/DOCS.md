@@ -35,19 +35,27 @@ Before the first start, stop the probe collector so only one Ring client is live
 1. The classification decides. An event is classified first and decided from the species, so until
    Claude has answered there is no decision and no run. Ring's own `human` label is the one
    exception: it skips the event for free and stops a run already going.
-2. A classifier failure that outlives its one retry is recorded as skip, reason `classifier_error`.
+2. v0.4: the add-on never asks a camera to take a picture. It uses the snapshot Ring already
+   captured at detection, fetched by uuid, or frames from the clip Ring recorded. The page shows a
+   median trigger latency tile, an image source tile and an image column per event, so the delay
+   from the Ring event to the valve command is visible per event.
+3. v0.4: a run is refused when a person was seen on that camera within the last run length, and an
+   event that went stale while waiting for its clip is refused too.
+4. A classifier failure that outlives its one retry is recorded as skip, reason `classifier_error`.
    The add-on never waters the yard without a classification.
-3. The log line `ExperimentalWarning: SQLite is an experimental feature and might change at any
+5. The log line `ExperimentalWarning: SQLite is an experimental feature and might change at any
    time` appears on every start. The add-on uses the built-in `node:sqlite` module so that there is
    no native build in the image. The warning is expected and is not an error.
-4. Events older than `stale_after_s` (default 300 seconds), or created before the add-on started,
+6. Events older than `stale_after_s` (default 300 seconds), or created before the add-on started,
    are recorded with the reason `stale` and never run a valve. A restart does not spray at a backlog.
-5. Stopping or restarting the add-on during a run closes the open valves first, best effort with a
+7. Stopping or restarting the add-on during a run closes the open valves first, best effort with a
    five second cap.
-6. The water figures on the page are valve open time, not measured water: the hose timer reports no
+8. The water figures on the page are valve open time, not measured water: the hose timer reports no
    flow or volume today, so the flow tile reads "not reported".
 
 ## Knobs and the page
 
-The runtime knobs are Home Assistant helper entities, all fourteen re-read on every decision.
+The runtime knobs are Home Assistant helper entities, all twelve re-read on every decision. v0.4
+removed `input_select.auto_ttds_mode` and `input_number.auto_ttds_classifier_max_wait_s`, which had
+stopped doing anything in v0.3; the add-on no longer reads them, whether or not they still exist.
 The full table, the review page description and the do-not list are in the repository README.

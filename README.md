@@ -13,9 +13,14 @@ The classification decides whether water runs. Nothing else does.
 2. If Ring itself says the event is a person, the answer is skip, reason `person`, decided on the
    spot for nothing. That event is never classified, and it stops any run already going on that
    camera.
-3. Otherwise it gets an image as fast as it can: the push snapshot first, because it arrives within
-   seconds, and the clip frames at 1, 3 and 6 seconds when there is no snapshot.
-4. Claude classifies whatever images exist and returns one species from a fixed list.
+3. Otherwise it gets an image as fast as it can: the snapshot that came with the Ring push, when
+   there was one, which arrives within seconds, and otherwise the clip, and frames from it at 1, 3
+   and 6 seconds. Both are images Ring had already captured. The add-on never asks a camera to take
+   a new picture, so it never wakes a camera and never costs battery.
+4. Claude classifies what it has: one image when that image is the push snapshot, because a
+   snapshot is a single moment and a second copy of it would buy nothing; all three frames on the
+   clip path, where the extra frames cost no extra wall-clock and catch an animal that appears
+   late. It returns one species from a fixed list.
 5. The decision is made from that species, using the knobs below, and only then do the mapped Rachio
    valves start. Until a classification exists an event has no decision and no run. A classifier
    failure that outlives its one retry is recorded as skip, reason `classifier_error`: the system
@@ -36,9 +41,9 @@ field that nothing acts on, plus a count, a confidence and a line of evidence.
 
 `target` is the only one that runs water. The skips are `disabled`, `not_greenlisted`, `person`,
 `no_animal`, `friendly`, `non_target`, `cooldown`, `cap`, `program_running`, `stale` and
-`classifier_error`. `blackout`, `dry_run`, `test` and `no_verdict_timeout` are schema slots that are
-never written: a blackout entry is warned about and ignored, a dry run keeps the reason `target`,
-test rides as a flag, and the classifier wait it belonged to no longer exists.
+`classifier_error`. `blackout`, `dry_run` and `test` are schema slots that are never written: a
+blackout entry is warned about and ignored, a dry run keeps the reason `target`, and test rides as
+a flag. v0.4 removed the `no_verdict_timeout` slot, because the wait it belonged to is gone.
 
 ## Install
 
@@ -71,19 +76,22 @@ page.
 
 ## Knobs
 
-These are Home Assistant helper entities, fourteen of them, unchanged since v0.1. The add-on
-re-reads all fourteen helper states on every decision, fourteen GETs against the Supervisor API, so
-a knob change needs no restart and takes effect on the next event. Two of them changed meaning in
-v0.3, `target_labels` and `mode`; none was added or removed. A helper that does not exist falls back to its default. The staleness
-cutoff is not a helper: it is the `stale_after_s` add-on option above, because changing it should be
-a deliberate act rather than a slider.
+These are Home Assistant helper entities, twelve of them. The add-on re-reads all twelve helper
+states on every decision, twelve GETs against the Supervisor API, so a knob change needs no restart
+and takes effect on the next event. A helper that does not exist falls back to its default. The
+staleness cutoff is not a helper: it is the `stale_after_s` add-on option above, because changing it
+should be a deliberate act rather than a slider.
+
+v0.4 removed the two knobs that had stopped doing anything: `input_select.auto_ttds_mode` and
+`input_number.auto_ttds_classifier_max_wait_s`. Both belonged to a wait that ended in v0.3, when the
+classification moved in front of the decision. The add-on no longer reads either helper. It does not
+care whether they still exist in Home Assistant, so they can be deleted whenever it suits.
 
 | Helper entity | Type | Default | Meaning |
 |---|---|---|---|
 | `input_boolean.auto_ttds_enabled` | boolean | on | master switch; off means log only |
 | `input_boolean.auto_ttds_dry_run` | boolean | off | on means decide and log, never call Rachio |
 | `input_boolean.auto_ttds_test_mode` | boolean | off | on means every new event is tagged test |
-| `input_select.auto_ttds_mode` | select: immediate, classifier_wait | immediate | recorded on every decision and nothing more; since v0.3 the classification always comes first, so there is nothing left to wait for |
 | `input_text.auto_ttds_camera_greenlist` | text | 639481050,73991832 | camera ids that may trigger; an empty list means nothing triggers |
 | `input_text.auto_ttds_target_labels` | text | * | classifier species that fire, or `*` for any animal. `animal_unknown` and `eyes_unknown` are animals |
 | `input_text.auto_ttds_friendlies` | text | rabbit | classifier species that suppress the run outright |
@@ -93,7 +101,6 @@ a deliberate act rather than a slider.
 | `input_number.auto_ttds_daily_cap` | number 0 to 500 | 0 | 0 means no cap |
 | `input_text.auto_ttds_blackout` | text | empty | reserved; v1 knows no conditions, so any entry is logged and ignored |
 | `input_boolean.auto_ttds_skip_when_program_running` | boolean | on | skip when a Rachio program is watering a target valve |
-| `input_number.auto_ttds_classifier_max_wait_s` | number 0 to 300 | 120 | recorded and nothing more; since v0.3 there is no firing without a verdict to wait out |
 
 ## What the add-on will not do
 
@@ -111,6 +118,15 @@ a deliberate act rather than a slider.
    event Ring has already called human. That is the cost control on the Claude spend.
 6. An Anthropic outage that outlasts the single retry leaves those events unclassified. There is no
    later sweep, the verdict row holds the error, and the decision is skip `classifier_error`.
+7. It does not ask a camera to take a picture. The only images it uses are the snapshot Ring already
+   captured at detection, fetched by uuid, and frames cut from the clip Ring recorded. Nothing here
+   wakes a camera or drains a battery.
+8. It does not start a run when a person was seen on that camera within the last run length. Stopping
+   a run only reaches a run that has already started, so a human push landing seconds before a
+   classification finishes would otherwise open a valve with the person still in frame. That event
+   is recorded as skip, reason `person`.
+9. It does not fire at an event that went stale while it waited. The `stale_after_s` cutoff is
+   applied again at the moment of decision, not only when the event was first seen.
 
 ## Reliability
 
@@ -133,13 +149,14 @@ a deliberate act rather than a slider.
 The page is served over ingress from the add-on sidebar panel.
 
 1. Tiles: events today and over 7 days, events fired today, runs today and over 7 days, valve
-   seconds today and over 7 days, flow, spend this month, push status, median clip delay, and
-   false-spray and miss rates split into day and night. Each rate tile shows its denominator, for
-   example "2 of 9"; an event with no Yes or No answer counts in neither.
+   seconds today and over 7 days, flow, spend this month, push status, median trigger latency over
+   7 days, the split of events by image source over 7 days, median clip delay, and false-spray and
+   miss rates split into day and night. Each rate tile shows its denominator, for example "2 of 9";
+   an event with no Yes or No answer counts in neither.
 2. Table, newest first, with filters for camera, Ring label, action, test events and unlabeled only.
    Each row shows the local time, camera, Ring label, species with confidence, action with reason,
-   the run (seconds requested, confirmed yes or no, and flow when it is known), clip delay, three
-   frame thumbnails and a clip button.
+   the run (seconds requested, confirmed yes or no, and flow when it is known), the image source and
+   the trigger latency in seconds when it fired, clip delay, frame thumbnails and a clip button.
 3. Label controls on each row, two independent judgements plus a note:
    a "was" box prefilled with the classifier species, and a Yes or No answer to "should have fired".
    Either can be set on its own. Labels export at `api/export/labels.csv`.
@@ -149,6 +166,40 @@ The page is served over ingress from the add-on sidebar panel.
    ingress can use it.
 6. The page refreshes every 30 seconds. The tiles and charts always update. The table holds still
    while you have a label field focused or an unsaved edit, so nothing you typed is thrown away.
+
+## Speed, and where the seconds go
+
+The gap between an animal walking past the camera and a valve opening, measured over the first 48
+events after go-live:
+
+1. A push delivers 14 of 48 events, a median 7.6 seconds after the Ring event, and every push so
+   far carried a snapshot uuid. That path reaches a valve command about 9.5 seconds after the event:
+   7.6 to the push, 1.9 to classify.
+2. A poll delivers the other 34, a median 32 seconds after the Ring event. That is Ring's own list
+   lag, not the 10 second poll interval, so a shorter interval would not help.
+3. A poll-discovered event then waits for the clip, a median 36 seconds after the event, and reaches
+   a valve command around 38 seconds.
+4. The valve itself takes about 8 seconds to acknowledge, and that is fixed hardware. It is not
+   counted in the trigger latency figure, which stops at the moment the command is issued.
+
+v0.4 does not shorten the poll path. Asking the camera for a live snapshot was tried and dropped:
+the library call that does it sets `extras=force` against the next-snapshot endpoint, which tells
+the camera to take a new picture, and these are battery cameras that report they cannot capture a
+snapshot while they are recording, which is exactly the moment we would ask. For a measured median
+saving of 2 to 4 seconds that is not a trade worth making. What v0.4 does instead is measure the
+delay honestly, and stop the pipeline wasting it:
+
+1. `events.image_source`, `push_snapshot` or `clip_frames`, says which route each event took, which
+   is what explains a slow one.
+2. `decisions.trigger_latency_ms` runs from `events.ring_created_at` to the first `startWatering`
+   call. It is NULL when nothing fired, and NULL on a dry run, which issues no call to time.
+3. The classifier call no longer runs on the poll loop. That loop walks a batch of events one at a
+   time, so a slow Claude call used to delay every later event in the batch, including a human one
+   that has to stop the water. It is detached now, and the Anthropic client is built with a 20
+   second timeout and no SDK-level retries, against defaults of 600 seconds and two retries.
+4. An event that went stale while it waited for its clip is no longer fired at. Staleness is checked
+   again at decision time against the same `stale_after_s` option, so an animal that left half an
+   hour ago does not get watered at.
 
 ## Water, honestly
 

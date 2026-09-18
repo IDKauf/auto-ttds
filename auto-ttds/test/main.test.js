@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { App, backoffMs } from '../src/main.js';
+import { App, backoffMs, framesPatch, classifierClient, CLASSIFIER_TIMEOUT_MS } from '../src/main.js';
 import { Rachio } from '../src/rachio.js';
 import { knobDefaults } from '../src/config.js';
 import { Db } from '../src/db.js';
@@ -50,11 +50,12 @@ function stubClassifier(app, over = {}) {
 }
 
 /** Put a frame on disk for an event, the way the media loop would. */
-function giveFrames(app, eventId) {
+function giveFrames(app, eventId, seconds = [1]) {
   const dir = path.join(app.opts.data_dir, 'frames');
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, `${eventId}_t1.jpg`), 'jpeg');
-  app.db.updateEvent(eventId, { frames_json: `["${eventId}_t1.jpg"]` });
+  const names = seconds.map((sec) => `${eventId}_t${sec}.jpg`);
+  for (const name of names) fs.writeFileSync(path.join(dir, name), 'jpeg');
+  app.db.updateEvent(eventId, { frames_json: JSON.stringify(names) });
 }
 
 /** An App with a real database in a temp directory and every network edge stubbed. */
@@ -574,5 +575,280 @@ test('a label that turns human before anything was decided is decided as a perso
   await app.classifyPass();
   assert.equal(app.classifier.calls.length, 0);
   assert.equal(app.db.runsForEvent('p10').length, 0);
+  cleanup();
+});
+
+// ---- v0.4: the poll path stops waiting for the clip -------------------------
+
+test('no camera is ever asked for an image the add-on does not already have', async () => {
+  const { app, cleanup } = makeApp();
+  // Any capture route would have to go through the camera object, so fail loudly on all of them.
+  const trap = (name) => () => { throw new Error(`${name} must never be called`); };
+  const guarded = { ...CAM, getSnapshot: trap('getSnapshot'), getNextSnapshot: trap('getNextSnapshot') };
+  app.ring.camera = () => guarded;
+  let byUuid = 0;
+  app.ring.saveSnapshot = async (camera, id, uuid) => {
+    byUuid += 1;
+    assert.ok(uuid, 'a stored image is only ever fetched by the uuid the push carried');
+    return null;
+  };
+
+  await app.handleEvent(guarded, ringEvent('c1'));            // poll, animal, no image
+  await app.handleEvent(IGNORED, ringEvent('c2'));            // off the greenlist
+  await app.handleEvent(guarded, ringEvent('c3', { cv_properties: { detection_type: 'human', detection_types: [] } }));
+  await app.handlePush(guarded, push('c4', 'other_motion'));  // a push with no snapshot uuid
+  await app.settle();
+  await tick();
+
+  assert.equal(byUuid, 0, 'a push with no uuid asks for nothing at all');
+  assert.equal(app.db.getEvent('c1').snapshot_path, null, 'a polled event simply waits for its clip');
+  assert.equal(app.db.getEvent('c1').image_source, null);
+  assert.equal(app.db.getDecision('c1'), null, 'and nothing is decided until an image exists');
+  assert.equal(app.db.getDecision('c2').reason, 'not_greenlisted');
+  assert.equal(app.db.getDecision('c3').reason, 'person');
+  cleanup();
+});
+
+test('the push snapshot path records where its image came from', async () => {
+  const { app, cleanup } = makeApp();
+  const snapshot = path.join(app.opts.data_dir, 'frames', 'ps1_snapshot.jpg');
+  app.ring.saveSnapshot = async () => {
+    fs.mkdirSync(path.dirname(snapshot), { recursive: true });
+    fs.writeFileSync(snapshot, 'jpeg');
+    return snapshot;
+  };
+  await app.handlePush(CAM, push('ps1', 'other_motion', { img: { snapshot_uuid: 'uuid-ps1' } }));
+  await tick();
+  const row = app.db.getEvent('ps1');
+  assert.equal(row.image_source, 'push_snapshot');
+  assert.ok(row.image_ready_at);
+  assert.deepEqual(app.classifier.calls[0].images, [snapshot], 'one image on the push path too');
+  cleanup();
+});
+
+test('clip frames are recorded as the image source only when they are the image', () => {
+  const at = '2026-09-17T12:00:00.000Z';
+  const fresh = framesPatch({ event_id: 'e', image_source: null, snapshot_path: null }, ['e_t1.jpg', 'e_t3.jpg'], at);
+  assert.equal(fresh.image_source, 'clip_frames');
+  assert.equal(fresh.image_ready_at, at);
+  assert.deepEqual(JSON.parse(fresh.frames_json), ['e_t1.jpg', 'e_t3.jpg']);
+
+  // A clip that lands after the push snapshot already decided the event rewrites nothing.
+  const after = framesPatch({ event_id: 'e', image_source: 'push_snapshot', snapshot_path: '/f/e_snapshot.jpg' }, ['e_t1.jpg'], at);
+  assert.equal(after.image_source, undefined);
+  assert.equal(after.image_ready_at, undefined);
+  assert.deepEqual(JSON.parse(after.frames_json), ['e_t1.jpg']);
+
+  // A clip ffmpeg could not read claims nothing.
+  const empty = framesPatch({ event_id: 'e' }, [], at);
+  assert.equal(empty.image_source, undefined);
+  assert.deepEqual(JSON.parse(empty.frames_json), []);
+});
+
+test('trigger latency is recorded from the Ring event to the first valve command', async () => {
+  const { app, cleanup } = makeApp();
+  app.startedAt = iso(-60000); // this boot is a minute old, so a nine second old event is live
+  const created = iso(-9000); // the Ring event was nine seconds ago
+  await ingestAndClassify(app, CAM, ringEvent('lat1', { created_at: created }));
+
+  const decision = app.db.getDecision('lat1');
+  assert.equal(decision.action, 'fire');
+  const ms = decision.trigger_latency_ms;
+  assert.ok(Number.isInteger(ms), 'the figure is stored in milliseconds');
+  assert.ok(ms >= 9000 && ms < 12000, `measured from ring_created_at, saw ${ms} ms`);
+  assert.equal(app.db.runsForEvent('lat1').length, 2);
+  cleanup();
+});
+
+test('nothing fired means no trigger latency to report', async () => {
+  // A skip records none.
+  const skipped = makeApp({ friendlies: 'rabbit' });
+  stubClassifier(skipped.app, { species: 'rabbit' });
+  await ingestAndClassify(skipped.app, CAM, ringEvent('lat2'));
+  assert.equal(skipped.app.db.getDecision('lat2').reason, 'friendly');
+  assert.equal(skipped.app.db.getDecision('lat2').trigger_latency_ms, null);
+  skipped.cleanup();
+
+  // A dry run issues no startWatering, so there is no command to time.
+  const dry = makeApp({ dry_run: true });
+  await ingestAndClassify(dry.app, CAM, ringEvent('lat3'));
+  assert.equal(dry.app.db.getDecision('lat3').action, 'fire');
+  assert.equal(dry.app.db.runsForEvent('lat3').length, 2);
+  assert.equal(dry.app.db.getDecision('lat3').trigger_latency_ms, null, 'a dry run commands no valve');
+  dry.cleanup();
+});
+
+// ---- review fixes 1 to 5 ----------------------------------------------------
+
+/** A classifier stub that takes its time, so "the poll loop did not wait" is measurable. */
+function slowClassifier(app, delayMs) {
+  const calls = [];
+  app.classifier = {
+    calls,
+    classify: async (images) => {
+      calls.push({ images });
+      await new Promise((r) => setTimeout(r, delayMs));
+      return {
+        model: 'claude-haiku-4-5', species: 'coyote', count: 1, is_person: 0, friendly: 0,
+        confidence: 0.9, input_tokens: 2200, output_tokens: 120, usd: 0.0028, latency_ms: delayMs,
+        at: iso(), error: null,
+      };
+    },
+  };
+  return calls;
+}
+
+test('fix 1: a slow snapshot and a slow classifier never hold up the poll batch', async () => {
+  const { app, calls, release, cleanup } = makeApp({}, { hold: true, watering: () => ({ reason: 'QUICK_RUN' }) });
+  await ingestAndClassify(app, CAM, ringEvent('live'));
+  assert.equal(app.activeRuns.size, 1, 'a run is going, which is when a person matters most');
+
+  // The classifier is now slow, and there are four animal events ahead of the human one.
+  slowClassifier(app, 150);
+  for (const id of ['b1', 'b2', 'b3', 'b4']) {
+    // Each already has an image, so each reaches the slow classifier the moment it is ingested.
+    const dir = path.join(app.opts.data_dir, 'frames');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, `${id}_t1.jpg`), 'jpeg');
+  }
+
+  const batch = [
+    ringEvent('b1'), ringEvent('b2'), ringEvent('b3'), ringEvent('b4'),
+    ringEvent('bhuman', { cv_properties: { detection_type: 'human', detection_types: [] } }),
+  ];
+  const t0 = Date.now();
+  for (const e of batch) {
+    await app.handleEvent(CAM, e); // exactly what ring.poll does with a batch
+    if (String(e.event_id).startsWith('b') && e.event_id !== 'bhuman') {
+      app.db.updateEvent(String(e.event_id), { frames_json: `["${e.event_id}_t1.jpg"]` });
+    }
+  }
+  const elapsed = Date.now() - t0;
+
+  assert.ok(elapsed < 120, `the poll batch did not wait on the slow work (took ${elapsed} ms, serial would be 600+)`);
+  assert.equal(app.db.getDecision('bhuman').reason, 'person', 'the human event was decided inside the batch');
+  const stops = calls.filter((c) => c.includes('stopWatering'));
+  assert.equal(stops.length, 2, 'and it stopped both open valves, with no delay');
+  for (const run of app.db.runsForEvent('live')) assert.equal(run.stopped_by, 'person');
+
+  await app.settle(); // the detached work still finishes, it just finishes off the poll clock
+  release();
+  await tick();
+  cleanup();
+});
+
+test('fix 1: the Anthropic client is bounded, not left on the SDK defaults', () => {
+  const client = classifierClient('not-a-real-key');
+  assert.equal(CLASSIFIER_TIMEOUT_MS, 20000);
+  assert.equal(client.timeout, 20000, 'the SDK default is 600000 ms');
+  assert.equal(client.maxRetries, 0, 'the SDK default is 2, on top of the one retry classify() makes');
+});
+
+test('fix 2: a human push seconds before the verdict stops the fire that has not started', async () => {
+  const { app, calls, cleanup } = makeApp();
+  // The person arrives first, with nothing running for stopActiveRuns to reach.
+  await app.handlePush(CAM, push('h9', 'human'));
+  await tick();
+  assert.equal(app.activeRuns.size, 0);
+
+  // The animal event that was already in flight now classifies and would have fired.
+  await app.handleEvent(CAM, ringEvent('a9'));
+  await app.settle();
+  giveFrames(app, 'a9');
+  await app.classifyPass();
+  await tick();
+
+  const decision = app.db.getDecision('a9');
+  assert.equal(decision.action, 'skip');
+  assert.equal(decision.reason, 'person');
+  assert.equal(app.db.runsForEvent('a9').length, 0);
+  assert.deepEqual(calls.filter((c) => c.includes('startWatering')), [], 'no valve was ever commanded');
+  assert.deepEqual(calls, [], 'and the skip cost no Rachio call at all');
+  cleanup();
+});
+
+test('fix 2: the block lasts one run length and then lets water through again', async () => {
+  const { app, cleanup } = makeApp({ run_seconds: 60 });
+  assert.equal(app.humanSeenRecently(CAM.id, 60, Date.now()), false, 'nobody seen yet');
+  app.markHuman(CAM.id, Date.now() - 30000);
+  assert.equal(app.humanSeenRecently(CAM.id, 60, Date.now()), true, 'inside the run that would start');
+  assert.equal(app.humanSeenRecently(CAM.id, 60, Date.now() + 31000), false, 'past it');
+  assert.equal(app.humanSeenRecently(IGNORED.id, 60, Date.now()), false, 'and it is per camera');
+
+  // A sighting the guard has let go of does not block anything.
+  app.markHuman(CAM.id, Date.now() - 90000); // a minute and a half ago, past a 60 s run
+  await ingestAndClassify(app, CAM, ringEvent('after'));
+  assert.equal(app.db.getDecision('after').action, 'fire');
+
+  // And a sighting inside the window does.
+  app.markHuman(CAM.id);
+  await ingestAndClassify(app, CAM, ringEvent('blocked'));
+  assert.equal(app.db.getDecision('blocked').reason, 'person');
+  assert.equal(app.db.runsForEvent('blocked').length, 0);
+  cleanup();
+});
+
+test('fix 5: an event that went stale while waiting for its clip does not fire', async () => {
+  const { app, calls, cleanup } = makeApp();
+  // The row was inserted live and has been sitting in the queue for 31 minutes.
+  const old = new Date(Date.now() - 31 * 60000).toISOString();
+  app.db.insertEvent({
+    event_id: 's9', camera_id: String(CAM.id), camera_name: CAM.name, ring_created_at: old,
+    first_seen_at: iso(), source: 'poll', kind: 'motion', ring_label: 'animal', test: 0, raw_json: '{}',
+  });
+  giveFrames(app, 's9');
+  await app.classifyPass();
+  await tick();
+
+  const decision = app.db.getDecision('s9');
+  assert.equal(decision.action, 'skip');
+  assert.equal(decision.reason, 'stale', 'staleness is re-checked at decision time, not only at insert');
+  assert.equal(app.db.runsForEvent('s9').length, 0);
+  assert.deepEqual(calls, [], 'and it costs no Rachio call');
+  assert.equal(app.db.getVerdict('s9').species, 'coyote', 'the verdict it waited for is still recorded');
+
+  // A fresh event on the same camera still fires, so the cutoff is age and nothing else.
+  await ingestAndClassify(app, CAM, ringEvent('fresh9'));
+  assert.equal(app.db.getDecision('fresh9').action, 'fire');
+  cleanup();
+});
+
+test('fix 5: the stale cutoff is the existing stale_after_s option, not a new knob', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ttds-stale-'));
+  const app = new App({
+    data_dir: dataDir, poll_interval_s: 10, stale_after_s: 3600, classifier_model: 'claude-haiku-4-5',
+    anthropic_api_key: '', log_level: 'warning',
+  });
+  const knobs = knobDefaults();
+  app.knobStore = { get: () => knobs, refresh: async () => knobs, lastRefreshAt: null };
+  app.ha = { fireEvent: async () => {}, setState: async () => {}, getStates: async () => ({}) };
+  app.valves = [{ id: 'v1', name: 'Hose Sprinkler 1' }];
+  app.rachio = null;
+  stubClassifier(app);
+
+  // 31 minutes old, but this install allows an hour.
+  app.db.insertEvent({
+    event_id: 'wide', camera_id: String(CAM.id), ring_created_at: new Date(Date.now() - 31 * 60000).toISOString(),
+    first_seen_at: iso(), source: 'poll', ring_label: 'animal', test: 0,
+  });
+  await app.runDecision('wide', { species: 'coyote', is_person: false, source: 'classifier' });
+  await tick();
+  assert.equal(app.db.getDecision('wide').action, 'fire', 'a wider cutoff keeps the same event alive');
+  app.db.close();
+  fs.rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('fix 4: a human only named in the detection_types array still skips for free', async () => {
+  const { app, calls, cleanup } = makeApp();
+  const classifier = stubClassifier(app);
+  await app.handleEvent(CAM, ringEvent('hx', { cv_properties: { detection_type: null, detection_types: [{ detection_type: 'human' }] } }));
+  await app.settle();
+
+  assert.equal(app.db.getEvent('hx').ring_label, 'human');
+  const decision = app.db.getDecision('hx');
+  assert.equal(decision.reason, 'person');
+  assert.equal(JSON.parse(decision.knobs_json).verdict_source, 'ring');
+  assert.equal(classifier.length, 0, 'a person costs no classifier call, whatever shape the label came in');
+  assert.deepEqual(calls, []);
   cleanup();
 });

@@ -226,3 +226,66 @@ test('downloadClip writes the file once and skips a null recording URL', async (
   assert.equal(await noUrl.downloadClip({ id: 1, getRecordingUrl: async () => null }, { event_id: 'ev10', ring_created_at: 'x', ding_id_str: '2' }), null);
   fs.rmSync(dataDir, { recursive: true, force: true });
 });
+
+// ---- v0.4: snapshots are fetched, never captured ---------------------------
+
+test('the push snapshot is fetched by uuid, from the image Ring already took', async () => {
+  const dataDir = tmp('uuid');
+  const seen = [];
+  const camera = {
+    id: 1,
+    getSnapshotByUuid: async (uuid) => { seen.push(uuid); return Buffer.from('push'); },
+    getSnapshot: async () => { throw new Error('getSnapshot must never be called: it forces a new capture'); },
+  };
+  const ingest = new RingIngest({ dataDir });
+  const out = await ingest.saveSnapshot(camera, 'ev6', 'uuid-6');
+  assert.equal(out, path.join(dataDir, 'frames', 'ev6_snapshot.jpg'));
+  assert.equal(fs.readFileSync(out, 'utf8'), 'push');
+  assert.deepEqual(seen, ['uuid-6'], 'the stored-image endpoint, which has no force flag');
+
+  assert.equal(await ingest.saveSnapshot(camera, 'ev7', null), null, 'no uuid means no image to fetch');
+  assert.equal(await ingest.saveSnapshot({ id: 1 }, 'ev8', 'uuid-8'), null, 'a camera without the method is skipped');
+  assert.equal(await ingest.saveSnapshot({ id: 1, getSnapshotByUuid: async () => { throw new Error('gone'); } }, 'ev9', 'u'), null);
+  assert.equal(await ingest.saveSnapshot({ id: 1, getSnapshotByUuid: async () => null }, 'ev10', 'u'), null, 'an empty body writes nothing');
+  assert.equal(fs.existsSync(path.join(dataDir, 'frames', 'ev10_snapshot.jpg')), false);
+  fs.rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('nothing in the add-on can ask a camera to take a new picture', () => {
+  const dir = new URL('../src/', import.meta.url);
+  const offenders = [];
+  for (const name of fs.readdirSync(dir)) {
+    if (!name.endsWith('.js')) continue;
+    const text = fs.readFileSync(new URL(name, dir), 'utf8');
+    // Strip comments, which name the method to explain why it is not used.
+    const code = text.replace(/\/\*[\s\S]*?\*\//g, '').split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+    if (/getSnapshot\s*\(/.test(code)) offenders.push(name);
+    if (/getNextSnapshot|snapshots\/next|extras=force/.test(code)) offenders.push(`${name} (capture endpoint)`);
+  }
+  assert.deepEqual(offenders, [], 'only getSnapshotByUuid is allowed: getSnapshot forces a capture');
+});
+
+test('fix 4: a human label counts whether it is the scalar or only in the array', () => {
+  const camera = { id: 639481050, name: 'Cat Cam' };
+  const base = { event_id: 'ev1', created_at: '2026-09-17T04:05:06.000Z', kind: 'motion' };
+
+  // The shape v0.3 already handled.
+  const scalar = eventRow(camera, { ...base, cv_properties: { detection_type: 'human', detection_types: [{ detection_type: 'human' }] } }, 'poll');
+  assert.equal(scalar.ring_label, 'human');
+
+  // The shape it missed: the array says human, the scalar does not.
+  const arrayOnly = eventRow(camera, { ...base, cv_properties: { detection_type: null, detection_types: [{ detection_type: 'human' }] } }, 'poll');
+  assert.equal(arrayOnly.ring_label, 'human', 'a person must cost nothing to decide, in either shape');
+  assert.deepEqual(JSON.parse(arrayOnly.ring_labels_json), ['human']);
+
+  // Plain strings in the array count too, and so does a mixed list.
+  const strings = eventRow(camera, { ...base, cv_properties: { detection_type: 'other_motion', detection_types: ['human'] } }, 'poll');
+  assert.equal(strings.ring_label, 'human');
+  const mixed = eventRow(camera, { ...base, cv_properties: { detection_type: 'animal', detection_types: [{ detection_type: 'animal' }, { detection_type: 'human' }] } }, 'poll');
+  assert.equal(mixed.ring_label, 'human', 'a person in the frame wins over the animal beside them');
+
+  // And nothing else is promoted.
+  const animal = eventRow(camera, { ...base, cv_properties: { detection_type: 'animal', detection_types: [{ detection_type: 'animal' }] } }, 'poll');
+  assert.equal(animal.ring_label, 'animal');
+  assert.equal(eventRow(camera, base, 'poll').ring_label, null);
+});

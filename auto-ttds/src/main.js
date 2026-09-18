@@ -25,6 +25,34 @@ export function backoffMs(consecutiveFailures) {
 
 const listKnob = (v) => String(v ?? '').split(',').map((s) => s.trim()).filter(Boolean);
 
+/**
+ * framesPatch: the events patch for a clip whose frames have just been extracted (v0.4).
+ * Pure, so the rule is testable without ffmpeg.
+ *
+ * image_source records the image the classifier will actually read, so a clip that lands after a
+ * snapshot already decided the event never rewrites how that decision was reached, and a clip that
+ * produced no frames claims nothing.
+ */
+export function framesPatch(event, frameNames, at) {
+  const patch = { frames_json: JSON.stringify(frameNames ?? []) };
+  if ((frameNames ?? []).length && !event?.image_source && !event?.snapshot_path) {
+    patch.image_source = 'clip_frames';
+    patch.image_ready_at = at;
+  }
+  return patch;
+}
+
+/**
+ * The Anthropic client (fix 1). The SDK defaults are a 600 s timeout and two retries, so a single
+ * bad call could hold the classifier for minutes. One bounded attempt per call here; classify()
+ * still makes its own single retry, which is the behavior v0.3 shipped.
+ */
+export const CLASSIFIER_TIMEOUT_MS = 20000;
+
+export function classifierClient(apiKey) {
+  return new Anthropic({ apiKey, timeout: CLASSIFIER_TIMEOUT_MS, maxRetries: 0 });
+}
+
 /** Ring says human. That is the one label that decides anything, and it costs no classifier call. */
 const isHumanLabel = (label) => String(label ?? '').trim().toLowerCase() === 'human';
 
@@ -45,6 +73,13 @@ class App {
     this.valves = [];
     this.baseStationId = null;
     this.classifying = new Set();
+    // Fix 1: work the poll loop must never wait on. ring.poll() walks a batch of events serially,
+    // so anything slow awaited from handleEvent delays every later event in that batch, including
+    // a human one that has to stop the water.
+    this.detached = new Set();
+    // Fix 2: the last time a person was seen on each camera, as epoch ms. A run refuses to start
+    // while that is recent, because stopActiveRuns can only stop a run that has already started.
+    this.lastHumanAt = new Map();
     this.startedAt = nowIso(); // review item 1: everything older than this is backlog
     this.pollFailures = 0;
     this.pollDelayMs = opts.poll_interval_s * 1000;
@@ -53,6 +88,45 @@ class App {
 
   knobs() { return this.knobStore.get(); }
   greenCameras() { return listKnob(this.knobs().camera_greenlist); }
+
+  /**
+   * detach: run a job off the caller's clock (fix 1). Errors are logged, never thrown at the poll
+   * loop, and the promise is tracked so shutdown and the tests can wait for it.
+   */
+  detach(name, fn) {
+    const job = Promise.resolve()
+      .then(fn)
+      .catch((err) => log.error(`${name} failed: ${err.message}`))
+      .finally(() => this.detached.delete(job));
+    this.detached.add(job);
+    return job;
+  }
+
+  /** settle: wait for every detached job, including jobs those jobs started. */
+  async settle() {
+    while (this.detached.size) await Promise.all([...this.detached]);
+  }
+
+  /** markHuman: a person was just seen on this camera (fix 2). */
+  markHuman(cameraId, at = Date.now()) {
+    if (cameraId === null || cameraId === undefined) return;
+    this.lastHumanAt.set(String(cameraId), at);
+  }
+
+  /**
+   * humanSeenRecently: was a person seen on this camera inside the window a run would cover?
+   *
+   * The stop-on-human path can only stop a run that is already in activeRuns. A human push that
+   * lands seconds before an animal classification finishes would otherwise start the water with the
+   * person still in frame and nothing left to stop it. The window is run_seconds, the length of the
+   * run that would start, so the guard covers exactly the time that water would be on.
+   */
+  humanSeenRecently(cameraId, runSeconds, now = Date.now()) {
+    const at = this.lastHumanAt.get(String(cameraId));
+    if (at === undefined) return false;
+    const windowMs = Math.max(0, Number(runSeconds) || 60) * 1000;
+    return now - at < windowMs;
+  }
 
   // ---- ingest (spec 6.1) ------------------------------------------------
   async handleEvent(camera, e) {
@@ -85,11 +159,12 @@ class App {
   }
 
   /**
-   * triage: what happens to a brand new event, v0.3.
+   * triage: what happens to a brand new event, v0.4.
    * Nothing here decides to fire. Only a classification can do that.
    * 1. A camera off the greenlist is decided now and never classified: that is the cost control.
    * 2. Ring calling it human is decided now as skip/person, and costs no classifier call either.
-   * 3. Everything else gets an image as fast as it can and is decided when the verdict lands.
+   * 3. Everything else is classified from whatever image exists, and decided when the verdict lands.
+   *    On the poll path that classification is detached, see below.
    */
   async triage(row) {
     const id = String(row.event_id);
@@ -101,16 +176,23 @@ class App {
       await this.runDecision(id, RING_PERSON_VERDICT);
       return;
     }
-    // No decision yet. The snapshot path (push) or the clip path (media loop) feeds the classifier,
-    // and classifyEvent decides as soon as it has an answer.
+    // Fix 1: on the poll path the classification runs detached. ring.poll() awaits onEvent for
+    // every event in a batch in turn, so a classifier call that sits on its own timeout and retry
+    // would hold up every later event in that batch. The one that must never wait is a human
+    // event, which has to reach stopIfPerson while the water is on.
+    if (String(row.source) === 'poll') {
+      this.detach(`classify ${id}`, () => this.classifyEvent(id));
+      return;
+    }
+    // No decision yet. The push snapshot or the clip path (media loop) feeds the classifier, and
+    // classifyEvent decides as soon as it has an answer.
     await this.classifyEvent(id);
   }
 
   /** A decision no knob can change: the event is too old, or nothing could be classified. */
   async recordSkip(eventId, reason, detail = {}) {
     const decision = {
-      event_id: eventId, at: nowIso(), action: 'skip', reason, mode: this.knobs().mode,
-      knobs_json: JSON.stringify(detail),
+      event_id: eventId, at: nowIso(), action: 'skip', reason, knobs_json: JSON.stringify(detail),
     };
     this.db.upsertDecision(decision);
     await this.ha.fireEvent('auto_ttds_decision', decision);
@@ -174,8 +256,10 @@ class App {
     });
     const human = isHumanLabel(ding.detection_type);
     if (human) {
-      // A person stops whatever is running, always. The decision is only written when nothing has
-      // decided this event yet, so a push never rewrites a decision the pipeline already made.
+      // A person stops whatever is running, always, and blocks anything about to start (fix 2).
+      // The decision is only written when nothing has decided this event yet, so a push never
+      // rewrites a decision the pipeline already made.
+      this.markHuman(String(camera.id));
       await this.stopIfPerson({ camera_id: String(camera.id), ring_label: 'human' });
       if (!this.db.getDecision(id)) await this.runDecision(id, RING_PERSON_VERDICT);
       return;
@@ -189,14 +273,14 @@ class App {
     if (uuid && !row?.snapshot_path && this.greenCameras().includes(String(camera.id))) {
       try {
         const p = await this.ring.saveSnapshot(camera, id, uuid);
-        if (p) this.db.updateEvent(id, { snapshot_path: p });
+        if (p) this.db.updateEvent(id, { snapshot_path: p, image_source: 'push_snapshot', image_ready_at: nowIso() });
       } catch (err) {
         log.debug(`snapshot for ${id} failed: ${err.message}`);
       }
     }
     // A row the poll already inserted has been triaged once, so it only needs the classifier.
     if (known) await this.classifyEvent(id);
-    else await this.triage(this.db.getEvent(id) ?? { event_id: id, camera_id: String(camera.id) });
+    else await this.triage(this.db.getEvent(id) ?? { event_id: id, camera_id: String(camera.id), source: 'push' });
   }
 
   // ---- decision ---------------------------------------------------------
@@ -224,6 +308,24 @@ class App {
     // Review item 9: decide once with no Rachio call. Only a decision that would otherwise fire is
     // worth a getValve, so every skip path costs zero Rachio requests.
     let result = decide(event, verdict, knobs, state);
+
+    // Fix 5: staleness is checked again here, not only at insert. An event can sit in the queue for
+    // half an hour waiting for a clip, and firing at an animal that has long gone wastes water and
+    // is the opposite of what this add-on is for. Same stale_after_s option, no new knob. Only a
+    // fire is converted, so every decide() reason stays exactly as decide() wrote it.
+    if (result.action === 'fire' && isStale(event, { now: state.now, staleAfterS: this.opts.stale_after_s })) {
+      const ageS = Math.round((state.now - Date.parse(event.ring_created_at ?? event.first_seen_at)) / 1000);
+      log.warning(`refusing to fire ${eventId}: the event is ${ageS} s old, past stale_after_s`);
+      result = { ...result, action: 'skip', reason: 'stale' };
+    }
+
+    // Fix 2: a person seen on this camera within the run that is about to start. stopActiveRuns
+    // cannot reach a run that has not started, so this is the only place that sequence is caught.
+    if (result.action === 'fire' && this.humanSeenRecently(event.camera_id, knobs.run_seconds, state.now)) {
+      log.warning(`refusing to fire ${eventId}: a person was seen on camera ${event.camera_id} moments ago`);
+      result = { ...result, action: 'skip', reason: 'person' };
+    }
+
     if (result.action === 'fire' && knobs.skip_when_program_running !== false && valves.length) {
       if (await this.programRunning(valves)) {
         result = decide(event, verdict, knobs, { ...state, program_running: true });
@@ -236,7 +338,6 @@ class App {
       at: nowIso(),
       action: result.action,
       reason: result.reason,
-      mode: result.mode,
       knobs_json: JSON.stringify({
         ...knobs,
         dry_run: result.dryRun,
@@ -270,6 +371,17 @@ class App {
     const tracker = { camera_id: event.camera_id, stop: false, valves: [], stopSent: new Set() };
     this.activeRuns.set(event.event_id, tracker);
 
+    // v0.4 spec D.2: the one number that says whether this is fast enough. It is measured at the
+    // moment the first real startWatering leaves this process, so it holds everything the add-on
+    // controls and none of the eight seconds the valve hardware takes to acknowledge. A dry run
+    // issues no call, so it records nothing.
+    const markTriggered = () => {
+      const created = Date.parse(event.ring_created_at ?? event.first_seen_at);
+      if (!Number.isFinite(created)) return;
+      const ms = Date.now() - created;
+      if (ms >= 0) this.db.setTriggerLatency(event.event_id, ms);
+    };
+
     const jobs = valveIds.map(async (valveId) => {
       const valveName = this.valves.find((v) => v.id === valveId)?.name ?? null;
       const base = {
@@ -283,6 +395,7 @@ class App {
       }
       const runId = this.db.insertRun(base);
       tracker.valves.push({ runId, valveId });
+      markTriggered(); // setTriggerLatency only writes once, so the first valve is the one timed
       try {
         await this.rachio.startAndConfirm(valveId, seconds, {
           onCalled: (patch) => this.db.updateRun(runId, patch),
@@ -333,9 +446,13 @@ class App {
     return jobs.length;
   }
 
-  /** Person stop (spec 6.6): a human Ring event cancels the runs on that camera. */
+  /**
+   * Person stop (spec 6.6): a human Ring event cancels the runs on that camera.
+   * It also records the sighting, so a fire that has not started yet is refused too (fix 2).
+   */
   async stopIfPerson(row) {
     if (String(row.ring_label ?? '').toLowerCase() !== 'human') return 0;
+    this.markHuman(row.camera_id);
     return this.stopActiveRuns('person', { cameraId: row.camera_id });
   }
 
@@ -351,7 +468,10 @@ class App {
       if (!clip) continue;
       this.db.updateEvent(event.event_id, { clip_path: clip, clip_ready_at: nowIso() });
       const written = await extractFrames(clip, this.opts.data_dir, event.event_id);
-      this.db.updateEvent(event.event_id, { frames_json: JSON.stringify(written.map((p) => path.basename(p))) });
+      // Re-read, because the download and the extraction both took time and a snapshot may have
+      // landed on this row in the meantime. The image that decided the event keeps the credit.
+      const current = this.db.getEvent(event.event_id) ?? event;
+      this.db.updateEvent(event.event_id, framesPatch(current, written.map((p) => path.basename(p)), nowIso()));
       const delayS = Math.round((Date.now() - Date.parse(event.ring_created_at)) / 1000);
       log.info(`clip ready ${event.event_id} after ${delayS}s, ${written.length} frames`);
     }
@@ -359,8 +479,13 @@ class App {
 
   // ---- classify, then decide (spec 6.4, v0.3 flow) ----------------------
   /**
-   * The images for one event, fastest first: the push snapshot arrives within seconds, the clip
-   * frames take minutes. Either is enough to classify (spec 3a to 3c).
+   * The images for one event, fastest first.
+   *
+   * A snapshot, whether it came with a push uuid or from a live request, is one image and that is
+   * all the classifier gets: it is a single moment, so a second copy of it would buy nothing and
+   * cost tokens and time. The clip fallback keeps all three frames at 1, 3 and 6 s, where the extra
+   * frames cost no extra wall-clock, because the clip is already on disk, and they catch an animal
+   * that walks into view late (spec B).
    */
   imagesFor(event) {
     if (event.snapshot_path && fs.existsSync(event.snapshot_path)) return [event.snapshot_path];
@@ -399,7 +524,10 @@ class App {
       }
       this.db.addCost(localDayKey(), verdict.input_tokens, verdict.output_tokens, verdict.usd);
       log.info(`verdict ${eventId} ${verdict.species} conf=${verdict.confidence} usd=${verdict.usd.toFixed(5)}`);
-      if (verdict.is_person === 1) await this.stopActiveRuns('person', { cameraId: event.camera_id });
+      if (verdict.is_person === 1) {
+        this.markHuman(event.camera_id); // fix 2: the classifier seeing a person counts as a sighting
+        await this.stopActiveRuns('person', { cameraId: event.camera_id });
+      }
       await this.runDecision(eventId, { ...verdict, is_person: verdict.is_person === 1, source: 'classifier' });
     } finally {
       this.classifying.delete(eventId);
@@ -460,7 +588,7 @@ class App {
     await this.knobStore.refresh();
 
     this.classifier = new Classifier({
-      client: new Anthropic({ apiKey: this.opts.anthropic_api_key }),
+      client: classifierClient(this.opts.anthropic_api_key),
       model: this.opts.classifier_model,
     });
 
@@ -516,6 +644,10 @@ class App {
       const cap = new Promise((r) => { const t = setTimeout(r, stopTimeoutMs); t.unref?.(); });
       await Promise.race([this.stopActiveRuns('shutdown'), cap]);
     }
+    // Detached classify work must not be left writing to a database this is about to close.
+    // Bounded, because the Supervisor will not wait long either.
+    const settled = new Promise((r) => { const t = setTimeout(r, 2000); t.unref?.(); });
+    await Promise.race([this.settle(), settled]);
     this.server?.close();
     this.ring?.disconnect();
     this.db.close();

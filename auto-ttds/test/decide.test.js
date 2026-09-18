@@ -10,7 +10,6 @@ const knobs = (over = {}) => ({
   enabled: true,
   dry_run: false,
   test_mode: false,
-  mode: 'immediate',
   camera_greenlist: '639481050,73991832',
   target_labels: '*',
   friendlies: 'rabbit',
@@ -20,7 +19,6 @@ const knobs = (over = {}) => ({
   daily_cap: 0,
   blackout: '',
   skip_when_program_running: true,
-  classifier_max_wait_s: 120,
   ...over,
 });
 
@@ -72,14 +70,25 @@ test('every reason string in the schema is accounted for', () => {
     assert.ok(emitted.has(r), `reason ${r} is covered by the table`);
   }
   // Schema slots decide() deliberately never emits.
-  for (const r of ['blackout', 'dry_run', 'test', 'no_verdict_timeout']) {
+  for (const r of ['blackout', 'dry_run', 'test']) {
     assert.ok(REASONS.includes(r), `reason ${r} is a known slot`);
     assert.ok(!emitted.has(r), `reason ${r} is not emitted`);
   }
   // main.js writes these two before or instead of a classification, covered in main.test.js.
   assert.ok(REASONS.includes('stale'));
   assert.ok(REASONS.includes('classifier_error'));
-  assert.equal(REASONS.length, 16);
+  assert.ok(!REASONS.includes('no_verdict_timeout'), 'v0.4: the defer slot is gone for good');
+  assert.equal(REASONS.length, 15);
+});
+
+test('decide no longer reports a mode, and the knob cannot change its answer (v0.4)', () => {
+  const r = decide(event(), verdict(), knobs(), state());
+  assert.ok(!('mode' in r), 'the result carries no mode field any more');
+  // Whatever a leftover helper might still say, the answer is the same.
+  const legacy = decide(event(), verdict(), knobs({ mode: 'classifier_wait', classifier_max_wait_s: 300 }), state());
+  assert.equal(legacy.action, 'fire');
+  assert.equal(legacy.reason, 'target');
+  assert.ok(!('mode' in legacy));
 });
 
 test('the Ring label is not an input to the decision (v0.3)', () => {

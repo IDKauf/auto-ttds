@@ -50,16 +50,18 @@ export function readOptions(optionsFile = '/data/options.json', env = process.en
 }
 
 // spec 4: helper entity -> knob. A missing helper falls back to the default.
-// v0.3 changed two meanings and removed no helper: all fourteen stay as they are.
-//  - target_labels now holds classifier species that fire, or "*" for any animal. It is no longer
-//    read against the Ring label, which only ever decides "person" now.
-//  - mode is recorded on every decision row and no longer changes anything: the classification
-//    always comes first, so there is nothing left to wait for or to run ahead of.
+// v0.4 removed the two knobs that had stopped doing anything, leaving twelve:
+//  - mode was recorded on every decision and changed nothing, because the classification always
+//    comes first, so there was nothing left to wait for or to run ahead of.
+//  - classifier_max_wait_s belonged to a wait that no longer exists.
+// The add-on simply stops reading those two helpers. It does not care whether they still exist in
+// Home Assistant, and deleting them changes nothing here.
+// target_labels holds classifier species that fire, or "*" for any animal (v0.3). It is not read
+// against the Ring label, which only ever decides "person".
 export const KNOB_SPEC = {
   enabled: { entity: 'input_boolean.auto_ttds_enabled', type: 'bool', def: true },
   dry_run: { entity: 'input_boolean.auto_ttds_dry_run', type: 'bool', def: false },
   test_mode: { entity: 'input_boolean.auto_ttds_test_mode', type: 'bool', def: false },
-  mode: { entity: 'input_select.auto_ttds_mode', type: 'str', def: 'immediate' },
   camera_greenlist: { entity: 'input_text.auto_ttds_camera_greenlist', type: 'str', def: '639481050,73991832' },
   target_labels: { entity: 'input_text.auto_ttds_target_labels', type: 'str', def: '*' },
   friendlies: { entity: 'input_text.auto_ttds_friendlies', type: 'str', def: 'rabbit' },
@@ -69,7 +71,6 @@ export const KNOB_SPEC = {
   daily_cap: { entity: 'input_number.auto_ttds_daily_cap', type: 'num', def: 0 },
   blackout: { entity: 'input_text.auto_ttds_blackout', type: 'str', def: '' },
   skip_when_program_running: { entity: 'input_boolean.auto_ttds_skip_when_program_running', type: 'bool', def: true },
-  classifier_max_wait_s: { entity: 'input_number.auto_ttds_classifier_max_wait_s', type: 'num', def: 120 },
 };
 
 export function knobDefaults() {

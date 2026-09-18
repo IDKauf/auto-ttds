@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { log } from './log.js';
-import { localDayStartIso, localMonthKey } from './db.js';
+import { localDayStartIso, localMonthKey, median } from './db.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = path.join(here, '..', 'web');
@@ -95,6 +95,9 @@ export function buildMetrics(db, extra = {}) {
   const medianDelay = sorted.length ? (sorted.length % 2 ? sorted[sorted.length >> 1] : (sorted[(sorted.length >> 1) - 1] + sorted[sorted.length >> 1]) / 2) : null;
   const valveToday = db.valveSecondsSince(dayStart);
   const valveWeek = db.valveSecondsSince(weekStart);
+  // v0.4: the Ring event to the first valve command, over the last 7 days. null until something
+  // fires, because an event that never started water has no such figure to report.
+  const triggerLatencyMedianMs = median(db.triggerLatenciesMsSince(weekStart));
   return {
     events_today: db.countSince('events', 'first_seen_at', dayStart),
     events_7d: db.countSince('events', 'first_seen_at', weekStart),
@@ -113,6 +116,9 @@ export function buildMetrics(db, extra = {}) {
     push_count: db.countPushes(),
     push_last_at: db.lastPushAt(),
     clip_delay_median_s: medianDelay,
+    trigger_latency_median_ms: triggerLatencyMedianMs,
+    trigger_latency_count_7d: db.triggerLatenciesMsSince(weekStart).length,
+    image_source_7d: db.imageSourceCountsSince(weekStart),
     label_rates: db.labelRates(),
     runs_per_day: db.runsPerDay(30),
     events_by_hour: db.eventsByHour(),

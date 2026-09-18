@@ -50,12 +50,11 @@ test('every option in the defaults is a documented knob path', () => {
   ]);
 });
 
-test('knob defaults match the spec 4 table', () => {
+test('knob defaults match the spec 4 table, minus the two v0.4 removed', () => {
   const d = knobDefaults();
   assert.equal(d.enabled, true);
   assert.equal(d.dry_run, false);
   assert.equal(d.test_mode, false);
-  assert.equal(d.mode, 'immediate');
   assert.equal(d.camera_greenlist, '639481050,73991832');
   assert.equal(d.target_labels, '*', 'v0.3: any classified animal fires by default');
   assert.equal(d.friendlies, 'rabbit');
@@ -65,22 +64,37 @@ test('knob defaults match the spec 4 table', () => {
   assert.equal(d.daily_cap, 0);
   assert.equal(d.blackout, '');
   assert.equal(d.skip_when_program_running, true);
-  assert.equal(d.classifier_max_wait_s, 120);
-  assert.equal(Object.keys(KNOB_SPEC).length, 14);
+  assert.equal(Object.keys(KNOB_SPEC).length, 12, 'fourteen minus mode and classifier_max_wait_s');
+});
+
+test('the two inert knobs are gone, and their helpers are no longer read (v0.4)', () => {
+  assert.ok(!('mode' in KNOB_SPEC));
+  assert.ok(!('classifier_max_wait_s' in KNOB_SPEC));
+  const entities = Object.values(KNOB_SPEC).map((s) => s.entity);
+  assert.ok(!entities.includes('input_select.auto_ttds_mode'));
+  assert.ok(!entities.includes('input_number.auto_ttds_classifier_max_wait_s'));
+
+  // A helper Ian has not deleted yet is simply ignored: nothing throws, nothing is stored.
+  const k = parseKnobs({
+    'input_select.auto_ttds_mode': 'classifier_wait',
+    'input_number.auto_ttds_classifier_max_wait_s': '300',
+    'input_boolean.auto_ttds_enabled': 'off',
+  });
+  assert.equal(k.mode, undefined);
+  assert.equal(k.classifier_max_wait_s, undefined);
+  assert.equal(k.enabled, false, 'and the knobs that remain still parse');
 });
 
 test('helper states are parsed, and a missing helper keeps its default', () => {
   const k = parseKnobs({
     'input_boolean.auto_ttds_enabled': 'off',
     'input_boolean.auto_ttds_dry_run': 'on',
-    'input_select.auto_ttds_mode': 'classifier_wait',
     'input_number.auto_ttds_run_seconds': '90.0',
     'input_text.auto_ttds_friendlies': 'rabbit,squirrel',
     'input_number.auto_ttds_daily_cap': 'unknown',
   });
   assert.equal(k.enabled, false);
   assert.equal(k.dry_run, true);
-  assert.equal(k.mode, 'classifier_wait');
   assert.equal(k.run_seconds, 90);
   assert.equal(k.friendlies, 'rabbit,squirrel');
   assert.equal(k.daily_cap, 0);

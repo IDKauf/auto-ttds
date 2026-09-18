@@ -101,7 +101,7 @@ dialog img, dialog video { max-width: 90vw; max-height: 78vh; display: block; }
     <table>
       <thead><tr>
         <th>Time</th><th>Camera</th><th>Ring</th><th>Species</th><th>Action</th>
-        <th>Run</th><th class="hide">Clip delay</th><th>Frames</th><th>Label</th>
+        <th>Run</th><th>Image</th><th class="hide">Clip delay</th><th>Frames</th><th>Label</th>
       </tr></thead>
       <tbody id="rows"></tbody>
     </table>
@@ -139,6 +139,22 @@ function flowTile(f) {
   return ['Flow, 7 days', f.yes + ' of ' + (f.yes + f.no), 'runs where the meter saw water move'];
 }
 
+// v0.4: trigger latency is the Ring event to the first valve command, so it is the whole pipeline
+// minus the fixed 8 s the valve takes to answer. The image split says which route each event took,
+// which is what explains a slow one: a push snapshot is seconds, a clip is half a minute.
+function latencyTile(m) {
+  const ms = m.trigger_latency_median_ms;
+  const n = m.trigger_latency_count_7d || 0;
+  const value = ms === null || ms === undefined ? '-' : (ms / 1000).toFixed(1) + ' s';
+  return ['Trigger latency median', value, 'Ring event to valve command, ' + n + ' fired in 7 days'];
+}
+
+function imageSourceTile(m) {
+  const c = m.image_source_7d || {};
+  const split = (c.push_snapshot || 0) + '/' + (c.clip_frames || 0);
+  return ['Image source, 7 days', split, 'push snapshot, clip frames'];
+}
+
 function renderTiles(m) {
   const r = m.label_rates || { day: {}, night: {} };
   const pushText = m.push_count ? m.push_count + ' seen' : 'none yet';
@@ -151,6 +167,8 @@ function renderTiles(m) {
     flowTile(m.flow_7d),
     ['Spend this month', '$' + num(m.spend_month_usd, 4), (m.calls_month || 0) + ' classifier calls'],
     ['Push status', pushText, m.push_last_at ? 'last ' + localTime(m.push_last_at) : 'poll is the live path'],
+    latencyTile(m),
+    imageSourceTile(m),
     ['Clip delay median', m.clip_delay_median_s === null ? '-' : num(m.clip_delay_median_s, 0) + ' s', 'Ring event to clip on disk'],
     ['False spray, day', pct(r.day.falseSprayRate), (r.day.falseSpray || 0) + ' of ' + (r.day.fired || 0) + ' fired and labeled'],
     ['False spray, night', pct(r.night.falseSprayRate), (r.night.falseSpray || 0) + ' of ' + (r.night.fired || 0) + ' fired and labeled'],
@@ -226,6 +244,15 @@ function runCell(row) {
   return parts.join(', ');
 }
 
+// Which image decided this event, and how long the whole pipeline took when it fired (v0.4).
+const IMAGE_LABELS = { push_snapshot: 'push snapshot', clip_frames: 'clip frames' };
+
+function imageCell(row) {
+  const src = IMAGE_LABELS[row.image_source] || (row.image_source ? String(row.image_source) : 'none yet');
+  if (row.trigger_latency_ms === null || row.trigger_latency_ms === undefined) return src;
+  return src + ', fired in ' + (Number(row.trigger_latency_ms) / 1000).toFixed(1) + ' s';
+}
+
 function clipDelay(row) {
   if (!row.clip_ready_at || !row.ring_created_at) return '-';
   return ((Date.parse(row.clip_ready_at) - Date.parse(row.ring_created_at)) / 1000).toFixed(0) + ' s';
@@ -277,6 +304,7 @@ function renderRows(events) {
       '<td data-h="Species">' + species + '</td>' +
       '<td data-h="Action">' + actionPill(row) + '</td>' +
       '<td data-h="Run">' + esc(runCell(row)) + '</td>' +
+      '<td data-h="Image">' + esc(imageCell(row)) + '</td>' +
       '<td data-h="Clip delay" class="hide">' + esc(clipDelay(row)) + '</td>' +
       '<td data-h="Frames" class="nolabel">' + frameCells(row) + '</td>' +
       '<td data-h="Label" class="nolabel">' + labelCell(row) + '</td>' +
@@ -371,8 +399,8 @@ async function load(force) {
     const data = await api('api/events?' + filterQuery());
     renderRows(data.events);
     const k = metrics.knobs || {};
-    $('status').textContent = 'mode ' + (k.mode || '?') + (k.enabled === false ? ', disabled' : '') + (k.dry_run ? ', dry run' : '') +
-      ' | updated ' + new Date().toLocaleTimeString();
+    $('status').textContent = (k.enabled === false ? 'disabled' : 'enabled') + (k.dry_run ? ', dry run' : '') +
+      (k.test_mode ? ', test mode' : '') + ' | updated ' + new Date().toLocaleTimeString();
   } catch (err) {
     $('status').textContent = 'load failed: ' + err.message;
   }
